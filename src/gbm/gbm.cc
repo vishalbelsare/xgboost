@@ -1,32 +1,30 @@
-/*!
- * Copyright 2015-2020 by Contributors
+/**
+ * Copyright 2015-2025, XGBoost Contributors
  * \file gbm.cc
  * \brief Registry of gradient boosters.
  */
-#include <dmlc/registry.h>
-#include <string>
-#include <vector>
-#include <memory>
-
 #include "xgboost/gbm.h"
+
+#include <dmlc/registry.h>
+
+#include <string>
+
+#include "xgboost/context.h"
 #include "xgboost/learner.h"
-#include "xgboost/generic_parameters.h"
 
 namespace dmlc {
 DMLC_REGISTRY_ENABLE(::xgboost::GradientBoosterReg);
 }  // namespace dmlc
 
 namespace xgboost {
-GradientBooster* GradientBooster::Create(
-    const std::string& name,
-    GenericParameter const* generic_param,
-    LearnerModelParam const* learner_model_param) {
-  auto *e = ::dmlc::Registry< ::xgboost::GradientBoosterReg>::Get()->Find(name);
+GradientBooster* GradientBooster::Create(const std::string& name, Context const* ctx,
+                                         LearnerModelState const* learner_model_state) {
+  auto const& gbm_name = name == "dart" ? std::string{"gbtree"} : name;
+  auto* e = ::dmlc::Registry<::xgboost::GradientBoosterReg>::Get()->Find(gbm_name);
   if (e == nullptr) {
     LOG(FATAL) << "Unknown gbm type " << name;
   }
-  auto p_bst =  (e->body)(learner_model_param);
-  p_bst->generic_param_ = generic_param;
+  auto p_bst = (e->body)(learner_model_state, ctx);
   return p_bst;
 }
 }  // namespace xgboost

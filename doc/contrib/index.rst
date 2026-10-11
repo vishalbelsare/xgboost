@@ -6,7 +6,7 @@ XGBoost has been developed by community members. Everyone is welcome to contribu
 
 * Code reviews for pull requests
 * Documentation and usage examples
-* Community participation in forums and issues
+* Community participation in `GitHub Discussions <https://github.com/dmlc/xgboost/discussions>`_ and issues
 * Code readability and developer guide
 
   - We welcome contributions that add code comments to improve readability.
@@ -23,8 +23,11 @@ Here are guidelines for contributing to various aspect of the XGBoost project:
   Community Guideline <community>
   donate
   coding_guide
+  consistency
+  python_packaging
   unit_tests
   Docs and Examples <docs>
+  featuremap
   git_guide
   release
   ci

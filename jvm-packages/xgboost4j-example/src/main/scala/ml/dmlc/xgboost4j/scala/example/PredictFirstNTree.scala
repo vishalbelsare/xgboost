@@ -1,5 +1,5 @@
 /*
- Copyright (c) 2014 by Contributors
+ Copyright (c) 2014-2024 by Contributors
 
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.
@@ -17,14 +17,14 @@ package ml.dmlc.xgboost4j.scala.example
 
 import scala.collection.mutable
 
+import ml.dmlc.xgboost4j.scala.{DMatrix, XGBoost}
 import ml.dmlc.xgboost4j.scala.example.util.CustomEval
-import ml.dmlc.xgboost4j.scala.{XGBoost, DMatrix}
 
 object PredictFirstNTree {
 
   def main(args: Array[String]): Unit = {
-    val trainMat = new DMatrix("../../demo/data/agaricus.txt.train")
-    val testMat = new DMatrix("../../demo/data/agaricus.txt.test")
+    val trainMat = new DMatrix("../../demo/data/agaricus.txt.train?format=libsvm")
+    val testMat = new DMatrix("../../demo/data/agaricus.txt.test?format=libsvm")
 
     val params = new mutable.HashMap[String, Any]()
     params += "eta" -> 1.0
@@ -40,9 +40,9 @@ object PredictFirstNTree {
     // train a model
     val booster = XGBoost.train(trainMat, params.toMap, round, watches.toMap)
 
-    // predict use 1 tree
+    // predict using the first boosting iteration
     val predicts1 = booster.predict(testMat, false, 1)
-    // by default all trees are used to do predict
+    // by default all boosting iterations are used for prediction
     val predicts2 = booster.predict(testMat)
 
     val eval = new CustomEval

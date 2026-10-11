@@ -1,20 +1,29 @@
+/**
+ * Copyright 2020-2025, XGBoost Contributors
+ */
 #ifndef XGBOOST_COMMON_QUANTILE_CUH_
 #define XGBOOST_COMMON_QUANTILE_CUH_
 
-#include <memory>
+#include <thrust/logical.h>  // for any_of
 
-#include "xgboost/span.h"
-#include "xgboost/data.h"
+#include <algorithm>
+#include <cstddef>     // for size_t
+#include <functional>  // for equal_to
+
+#include "categorical.h"
+#include "common.h"          // for HumanMemUnit
+#include "cuda_context.cuh"  // for CUDAContext
+#include "cuda_rt_utils.h"   // for SetDevice
 #include "device_helpers.cuh"
+#include "error_msg.h"  // for InvalidMaxBin
 #include "quantile.h"
 #include "timer.h"
-#include "categorical.h"
+#include "xgboost/data.h"
+#include "xgboost/span.h"
 
-namespace xgboost {
-namespace common {
-
+namespace xgboost::common {
 class HistogramCuts;
-using WQSketch = WQuantileSketch<bst_float, bst_float>;
+using WQSketch = WQuantileSketch;
 using SketchEntry = WQSketch::Entry;
 
 namespace detail {
@@ -31,58 +40,41 @@ struct SketchUnique {
  */
 class SketchContainer {
  public:
-  static constexpr float kFactor = WQSketch::kFactor;
-  using OffsetT = bst_row_t;
+  using OffsetT = bst_idx_t;
   static_assert(sizeof(OffsetT) == sizeof(size_t), "Wrong type for sketch element offset.");
 
  private:
   Monitor timer_;
-  std::unique_ptr<dh::AllReducer> reducer_;
   HostDeviceVector<FeatureType> feature_types_;
-  bst_row_t num_rows_;
   bst_feature_t num_columns_;
   int32_t num_bins_;
-  int32_t device_;
 
-  // Double buffer as neither prune nor merge can be performed inplace.
-  dh::device_vector<SketchEntry> entries_a_;
-  dh::device_vector<SketchEntry> entries_b_;
-  bool current_buffer_ {true};
-  // The container is just a CSC matrix.
+  // The container is just a CSC matrix plus scratch storage for out-of-place transforms.
+  dh::device_vector<SketchEntry> entries_;
+  dh::device_vector<SketchEntry> entries_tmp_;
+  dh::device_vector<SketchEntry> prune_buffer_;
   HostDeviceVector<OffsetT> columns_ptr_;
-  HostDeviceVector<OffsetT> columns_ptr_b_;
+  HostDeviceVector<OffsetT> columns_ptr_tmp_;
 
   bool has_categorical_{false};
+  std::size_t rows_seen_{0};
 
-  dh::device_vector<SketchEntry>& Current() {
-    if (current_buffer_) {
-      return entries_a_;
-    } else {
-      return entries_b_;
-    }
+  void SetCurrentColumns(Span<OffsetT const> columns_ptr);
+  void CommitScratch(std::size_t n_entries) {
+    entries_.swap(entries_tmp_);
+    columns_ptr_.Copy(columns_ptr_tmp_);
+    entries_.resize(n_entries);
   }
-  dh::device_vector<SketchEntry>& Other() {
-    if (!current_buffer_) {
-      return entries_a_;
-    } else {
-      return entries_b_;
-    }
-  }
-  dh::device_vector<SketchEntry> const& Current() const {
-    return const_cast<SketchContainer*>(this)->Current();
-  }
-  dh::device_vector<SketchEntry> const& Other() const {
-    return const_cast<SketchContainer*>(this)->Other();
-  }
-  void Alternate() {
-    current_buffer_ = !current_buffer_;
+  [[nodiscard]] std::size_t IntermediateCutsPerFeature() const {
+    auto const eps = SketchEpsilon(num_bins_, std::max<std::size_t>(1, rows_seen_));
+    return WQSketch::LimitSizeLevel(std::max<std::size_t>(1, rows_seen_), eps);
   }
 
   // Get the span of one column.
   Span<SketchEntry> Column(bst_feature_t i) {
-    auto data = dh::ToSpan(this->Current());
+    auto data = dh::ToSpan(this->entries_);
     auto h_ptr = columns_ptr_.ConstHostSpan();
-    auto c = data.subspan(h_ptr[i], h_ptr[i+1] - h_ptr[i]);
+    auto c = data.subspan(h_ptr[i], h_ptr[i + 1] - h_ptr[i]);
     return c;
   }
 
@@ -91,21 +83,17 @@ class SketchContainer {
    *
    * \param max_bin     Maximum number of bins per columns
    * \param num_columns Total number of columns in dataset.
-   * \param num_rows    Total number of rows in known dataset (typically the rows in current worker).
    * \param device      GPU ID.
    */
-  SketchContainer(HostDeviceVector<FeatureType> const& feature_types,
-                  int32_t max_bin,
-                  bst_feature_t num_columns, bst_row_t num_rows,
-                  int32_t device)
-      : num_rows_{num_rows},
-        num_columns_{num_columns}, num_bins_{max_bin}, device_{device} {
-    CHECK_GE(device, 0);
+  SketchContainer(HostDeviceVector<FeatureType> const& feature_types, bst_bin_t max_bin,
+                  bst_feature_t num_columns, DeviceOrd device)
+      : num_columns_{num_columns}, num_bins_{max_bin} {
+    CHECK(device.IsCUDA());
     // Initialize Sketches for this dmatrix
-    this->columns_ptr_.SetDevice(device_);
-    this->columns_ptr_.Resize(num_columns + 1);
-    this->columns_ptr_b_.SetDevice(device_);
-    this->columns_ptr_b_.Resize(num_columns + 1);
+    this->columns_ptr_.SetDevice(device);
+    this->columns_ptr_.Resize(num_columns + 1, 0);
+    this->columns_ptr_tmp_.SetDevice(device);
+    this->columns_ptr_tmp_.Resize(num_columns + 1, 0);
 
     this->feature_types_.Resize(feature_types.Size());
     this->feature_types_.Copy(feature_types);
@@ -117,17 +105,37 @@ class SketchContainer {
     auto d_feature_types = feature_types_.ConstDeviceSpan();
     has_categorical_ =
         !d_feature_types.empty() &&
-        thrust::any_of(dh::tbegin(d_feature_types), dh::tend(d_feature_types),
-                       common::IsCatOp{});
+        thrust::any_of(dh::tbegin(d_feature_types), dh::tend(d_feature_types), common::IsCatOp{});
+    CHECK_GE(max_bin, 2) << error::InvalidMaxBin();
 
     timer_.Init(__func__);
   }
-  /* \brief Return GPU ID for this container. */
-  int32_t DeviceIdx() const { return device_; }
+  /**
+   * @brief Calculate the memory cost of the container.
+   */
+  [[nodiscard]] std::size_t MemCapacityBytes() const {
+    auto constexpr kE = sizeof(typename decltype(this->entries_)::value_type);
+    auto n_bytes = (this->entries_.capacity() + this->entries_tmp_.capacity() +
+                    this->prune_buffer_.capacity()) *
+                   kE;
+    n_bytes += (this->columns_ptr_.Size() + this->columns_ptr_tmp_.Size()) * sizeof(OffsetT);
+    n_bytes += this->feature_types_.Size() * sizeof(FeatureType);
+
+    return n_bytes;
+  }
+  [[nodiscard]] std::size_t MemCostBytes() const {
+    auto constexpr kE = sizeof(typename decltype(this->entries_)::value_type);
+    auto n_bytes =
+        (this->entries_.size() + this->entries_tmp_.size() + this->prune_buffer_.size()) * kE;
+    n_bytes += (this->columns_ptr_.Size() + this->columns_ptr_tmp_.Size()) * sizeof(OffsetT);
+    n_bytes += this->feature_types_.Size() * sizeof(FeatureType);
+
+    return n_bytes;
+  }
   /* \brief Whether the predictor matrix contains categorical features. */
   bool HasCategorical() const { return has_categorical_; }
   /* \brief Accumulate weights of duplicated entries in input. */
-  size_t ScanInput(Span<SketchEntry> entries, Span<OffsetT> d_columns_ptr_in);
+  size_t ScanInput(Context const* ctx, Span<SketchEntry> entries, Span<OffsetT> d_columns_ptr_in);
   /* Fix rounding error and re-establish invariance.  The error is mostly generated by the
    * addition inside `RMinNext` and subtraction in `RMaxPrev`. */
   void FixError();
@@ -136,72 +144,51 @@ class SketchContainer {
    *
    * \param entries Sorted entries.
    * \param columns_ptr CSC pointer for entries.
-   * \param cuts_ptr CSC pointer for cuts.
-   * \param total_cuts Total number of cuts, equal to the back of cuts_ptr.
    * \param weights (optional) data weights.
    */
-  void Push(Span<Entry const> entries, Span<size_t> columns_ptr,
-            common::Span<OffsetT> cuts_ptr, size_t total_cuts,
-            Span<float> weights = {});
-  /* \brief Prune the quantile structure.
+  void Push(Context const* ctx, Span<Entry const> entries, Span<size_t> columns_ptr,
+            bst_idx_t n_rows_in_batch, Span<float> weights = {});
+  /**
+   * @brief Prune the quantile structure.
    *
-   * \param to The maximum size of pruned quantile.  If the size of quantile
-   * structure is already less than `to`, then no operation is performed.
+   * @param to The maximum size of pruned quantile.  If the size of quantile structure is
+   *           already less than `to`, then no operation is performed.
    */
-  void Prune(size_t to);
-  /* \brief Merge another set of sketch.
-   * \param that columns of other.
+  void Prune(Context const* ctx, size_t to);
+  /**
+   * @brief Merge another set of sketch.
+   *
+   * @param that_columns_ptr Column pointer of the quantile summary being merged.
+   * @param that Columns of the other quantile summary.
    */
-  void Merge(Span<OffsetT const> that_columns_ptr,
+  void Merge(Context const* ctx, Span<OffsetT const> that_columns_ptr,
              Span<SketchEntry const> that);
+  /**
+   * @brief Shrink the internal data structure to reduce memory usage. Can be used after
+   *        prune.
+   */
+  void ShrinkToFit() {
+    this->entries_.shrink_to_fit();
+    this->entries_tmp_.clear();
+    this->entries_tmp_.shrink_to_fit();
+    LOG(DEBUG) << "Quantile memory cost:" << common::HumanMemUnit(this->MemCapacityBytes());
+  }
 
   /* \brief Merge quantiles from other GPU workers. */
-  void AllReduce();
+  void AllReduce(Context const* ctx);
   /* \brief Create the final histogram cut values. */
-  void MakeCuts(HistogramCuts* cuts);
+  [[nodiscard]] HistogramCuts MakeCuts(Context const* ctx);
 
-  Span<SketchEntry const> Data() const {
-    return {this->Current().data().get(), this->Current().size()};
-  }
+  Span<SketchEntry const> Data() const { return {entries_.data().get(), entries_.size()}; }
   HostDeviceVector<FeatureType> const& FeatureTypes() const { return feature_types_; }
-
-  Span<OffsetT const> ColumnsPtr() const { return this->columns_ptr_.ConstDeviceSpan(); }
+  Span<OffsetT const> ColumnsPtr() const { return columns_ptr_.ConstDeviceSpan(); }
 
   SketchContainer(SketchContainer&&) = default;
   SketchContainer& operator=(SketchContainer&&) = default;
 
   SketchContainer(const SketchContainer&) = delete;
   SketchContainer& operator=(const SketchContainer&) = delete;
-
-  /* \brief Removes all the duplicated elements in quantile structure. */
-  template <typename KeyComp = thrust::equal_to<size_t>>
-  size_t Unique(KeyComp key_comp = thrust::equal_to<size_t>{}) {
-    timer_.Start(__func__);
-    dh::safe_cuda(cudaSetDevice(device_));
-    this->columns_ptr_.SetDevice(device_);
-    Span<OffsetT> d_column_scan = this->columns_ptr_.DeviceSpan();
-    CHECK_EQ(d_column_scan.size(), num_columns_ + 1);
-    Span<SketchEntry> entries = dh::ToSpan(this->Current());
-    HostDeviceVector<OffsetT> scan_out(d_column_scan.size());
-    scan_out.SetDevice(device_);
-    auto d_scan_out = scan_out.DeviceSpan();
-    dh::XGBCachingDeviceAllocator<char> alloc;
-
-    d_column_scan = this->columns_ptr_.DeviceSpan();
-    size_t n_uniques = dh::SegmentedUnique(
-        thrust::cuda::par(alloc), d_column_scan.data(),
-        d_column_scan.data() + d_column_scan.size(), entries.data(),
-        entries.data() + entries.size(), scan_out.DevicePointer(),
-        entries.data(), detail::SketchUnique{}, key_comp);
-    this->columns_ptr_.Copy(scan_out);
-    CHECK(!this->columns_ptr_.HostCanRead());
-
-    this->Current().resize(n_uniques);
-    timer_.Stop(__func__);
-    return n_uniques;
-  }
 };
-}  // namespace common
-}  // namespace xgboost
+}  // namespace xgboost::common
 
 #endif  // XGBOOST_COMMON_QUANTILE_CUH_

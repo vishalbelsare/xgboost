@@ -4,3 +4,9 @@
 ^.*\.Rproj$
 ^\.Rproj\.user$
 README.md
+^doc$
+^Meta$
+^_pkgdown\.yml$
+^docs$
+^pkgdown$
+^tools/cmake-source-files$

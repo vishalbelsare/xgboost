@@ -1,328 +1,450 @@
-/*!
- * Copyright 2021 by XGBoost Contributors
+/**
+ * Copyright 2021-2026, XGBoost Contributors
  */
 #ifndef XGBOOST_TREE_HIST_HISTOGRAM_H_
 #define XGBOOST_TREE_HIST_HISTOGRAM_H_
 
-#include <algorithm>
-#include <limits>
-#include <vector>
+#include <algorithm>  // for max
+#include <cstddef>    // for size_t
+#include <cstdint>    // for int32_t
+#include <utility>    // for move
+#include <vector>     // for vector
 
-#include "rabit/rabit.h"
-#include "xgboost/tree_model.h"
-#include "../../common/hist_util.h"
-#include "../../data/gradient_index.h"
+#include "../../collective/allreduce.h"    // for Allreduce
+#include "../../common/cache_manager.h"    // for CacheManager
+#include "../../common/hist_util.h"        // for GHistRow, ParallelGHi...
+#include "../../common/row_set.h"          // for RowSetCollection
+#include "../../common/threading_utils.h"  // for ParallelFor2d, Range1d, BlockedSpace2d
+#include "../../data/gradient_index.h"     // for GHistIndexMatrix
+#include "expand_entry.h"                  // for MultiExpandEntry, CPUExpandEntry
+#include "hist_cache.h"                    // for BoundedHistCollection
+#include "hist_param.h"                    // for HistMakerTrainParam
+#include "xgboost/base.h"                  // for bst_node_t, bst_target_t, bst_bin_t
+#include "xgboost/context.h"               // for Context
+#include "xgboost/data.h"                  // for BatchIterator, BatchSet
+#include "xgboost/linalg.h"                // for MatrixView, All, Vect...
+#include "xgboost/logging.h"               // for CHECK_GE
+#include "xgboost/span.h"                  // for Span
+#include "xgboost/tree_model.h"            // for RegTree
 
-namespace xgboost {
-namespace tree {
-template <typename GradientSumT, typename ExpandEntry> class HistogramBuilder {
-  using GradientPairT = xgboost::detail::GradientPairInternal<GradientSumT>;
-  using GHistRowT = common::GHistRow<GradientSumT>;
+namespace xgboost::tree {
+/**
+ * @brief Decide which node as the build node for multi-target trees.
+ */
+void AssignNodes(MultiTargetTreeView const &tree,
+                 std::vector<MultiExpandEntry> const &valid_candidates,
+                 common::Span<bst_node_t> nodes_to_build, common::Span<bst_node_t> nodes_to_sub);
 
+/**
+ * @brief Decide which node as the build node.
+ */
+void AssignNodes(ScalarTreeView const &tree, std::vector<CPUExpandEntry> const &candidates,
+                 common::Span<bst_node_t> nodes_to_build, common::Span<bst_node_t> nodes_to_sub);
+
+class HistogramBuilder {
   /*! \brief culmulative histogram of gradients. */
-  common::HistCollection<GradientSumT> hist_;
-  /*! \brief culmulative local parent histogram of gradients. */
-  common::HistCollection<GradientSumT> hist_local_worker_;
-  common::GHistBuilder<GradientSumT> builder_;
-  common::ParallelGHistBuilder<GradientSumT> buffer_;
-  rabit::Reducer<GradientPairT, GradientPairT::Reduce> reducer_;
+  common::Monitor monitor_;
+  BoundedHistCollection hist_;
+  common::ParallelGHistBuilder buffer_;
   BatchParam param_;
-  int32_t n_threads_{-1};
-  size_t n_batches_{0};
+  std::int32_t n_threads_{-1};
   // Whether XGBoost is running in distributed environment.
   bool is_distributed_{false};
 
  public:
   /**
-   * \param total_bins       Total number of bins across all features
-   * \param max_bin_per_feat Maximum number of bins per feature, same as the `max_bin`
-   *                         training parameter.
-   * \param n_threads        Number of threads.
-   * \param is_distributed   Mostly used for testing to allow injecting parameters instead
+   * @brief Reset the builder, should be called before growing a new tree.
+   *
+   * @param total_bins       Total number of bins across all features
+   * @param is_distributed   Mostly used for testing to allow injecting parameters instead
    *                         of using global rabit variable.
    */
-  void Reset(uint32_t total_bins, BatchParam p, int32_t n_threads, size_t n_batches,
-             bool is_distributed) {
-    CHECK_GE(n_threads, 1);
-    n_threads_ = n_threads;
-    n_batches_ = n_batches;
+  void Reset(Context const *ctx, bst_bin_t total_bins, BatchParam const &p, bool is_distributed,
+             HistMakerTrainParam const *param) {
+    n_threads_ = ctx->Threads();
     param_ = p;
-    hist_.Init(total_bins);
-    hist_local_worker_.Init(total_bins);
+    hist_.Reset(total_bins, param->MaxCachedHistNodes(ctx->Device()));
     buffer_.Init(total_bins);
-    builder_ = common::GHistBuilder<GradientSumT>(total_bins);
     is_distributed_ = is_distributed;
   }
 
   template <bool any_missing>
-  void BuildLocalHistograms(size_t page_idx, common::BlockedSpace2d space,
-                            GHistIndexMatrix const &gidx,
-                            std::vector<ExpandEntry> const &nodes_for_explicit_hist_build,
+  void BuildLocalHistograms(common::BlockedSpace2d const &space, GHistIndexMatrix const &gidx,
+                            std::vector<bst_node_t> const &nodes_to_build,
                             common::RowSetCollection const &row_set_collection,
-                            const std::vector<GradientPair> &gpair_h) {
-    const size_t n_nodes = nodes_for_explicit_hist_build.size();
-    CHECK_GT(n_nodes, 0);
-
-    std::vector<GHistRowT> target_hists(n_nodes);
-    for (size_t i = 0; i < n_nodes; ++i) {
-      const int32_t nid = nodes_for_explicit_hist_build[i].nid;
-      target_hists[i] = hist_[nid];
-    }
-    if (page_idx == 0) {
-      // FIXME(jiamingy): Handle different size of space.  Right now we use the maximum
-      // partition size for the buffer, which might not be efficient if partition sizes
-      // has significant variance.
-      buffer_.Reset(this->n_threads_, n_nodes, space, target_hists);
-    }
-
+                            common::Span<GradientPair const> gpair_h, bool read_by_column) {
     // Parallel processing by nodes and data in each node
-    common::ParallelFor2d(space, this->n_threads_, [&](size_t nid_in_set, common::Range1d r) {
-      const auto tid = static_cast<unsigned>(omp_get_thread_num());
-      const int32_t nid = nodes_for_explicit_hist_build[nid_in_set].nid;
-      auto elem = row_set_collection[nid];
-      auto start_of_row_set = std::min(r.begin(), elem.Size());
-      auto end_of_row_set = std::min(r.end(), elem.Size());
-      auto rid_set = common::RowSetCollection::Elem(elem.begin + start_of_row_set,
-                                                    elem.begin + end_of_row_set, nid);
-      auto hist = buffer_.GetInitializedHist(tid, nid_in_set);
-      if (rid_set.Size() != 0) {
-        builder_.template BuildHist<any_missing>(gpair_h, rid_set, gidx, hist);
+    common::ParallelFor2d(
+        space, this->n_threads_,
+        common::WithWorker([&](size_t nid_in_set, common::Range1d r, common::Worker worker) {
+          const auto tid = static_cast<unsigned>(worker.Id());
+          bst_node_t const nidx = nodes_to_build[nid_in_set];
+          auto const &elem = row_set_collection[nidx];
+          auto start_of_row_set = std::min(r.begin(), elem.Size());
+          auto end_of_row_set = std::min(r.end(), elem.Size());
+          auto rid_set = common::Span<bst_idx_t const>{elem.begin() + start_of_row_set,
+                                                       elem.begin() + end_of_row_set};
+          auto hist = buffer_.GetInitializedHist(tid, nid_in_set);
+          if (rid_set.size() != 0) {
+            common::BuildHist<any_missing>(gpair_h, rid_set, gidx, hist, read_by_column,
+                                           this->n_threads_);
+          }
+        }));
+  }
+
+  /**
+   * @brief Allocate histogram, rearrange the nodes if `rearrange` is true and the tree
+   *        has reached the cache size limit.
+   */
+  template <typename TreeView>
+  void AddHistRows(TreeView const &tree, std::vector<bst_node_t> *p_nodes_to_build,
+                   std::vector<bst_node_t> *p_nodes_to_sub, bool rearrange) {
+    CHECK(p_nodes_to_build);
+    auto &nodes_to_build = *p_nodes_to_build;
+    CHECK(p_nodes_to_sub);
+    auto &nodes_to_sub = *p_nodes_to_sub;
+
+    // We first check whether the cache size is already exceeded or about to be exceeded.
+    // If not, then we can allocate histograms without clearing the cache and without
+    // worrying about missing parent histogram.
+    //
+    // Otherwise, we need to rearrange the nodes before the allocation to make sure the
+    // resulting buffer is contiguous. This is to facilitate efficient allreduce.
+
+    bool can_host = this->hist_.CanHost(nodes_to_build, nodes_to_sub);
+    // True if the tree is still within the size of cache limit. Allocate histogram as
+    // usual.
+    auto cache_is_valid = can_host && !this->hist_.HasExceeded();
+
+    if (!can_host) {
+      this->hist_.Clear(true);
+    }
+
+    if (!rearrange || cache_is_valid) {
+      // If not rearrange, we allocate the histogram as usual, assuming the nodes have
+      // been properly arranged by other builders.
+      this->hist_.AllocateHistograms(nodes_to_build, nodes_to_sub);
+      if (rearrange) {
+        CHECK(!this->hist_.HasExceeded());
       }
-    });
-  }
-
-  void
-  AddHistRows(int *starting_index, int *sync_count,
-              std::vector<ExpandEntry> const &nodes_for_explicit_hist_build,
-              std::vector<ExpandEntry> const &nodes_for_subtraction_trick,
-              RegTree *p_tree) {
-    if (is_distributed_) {
-      this->AddHistRowsDistributed(starting_index, sync_count,
-                                   nodes_for_explicit_hist_build,
-                                   nodes_for_subtraction_trick, p_tree);
-    } else {
-      this->AddHistRowsLocal(starting_index, sync_count,
-                             nodes_for_explicit_hist_build,
-                             nodes_for_subtraction_trick);
-    }
-  }
-
-  /** Main entry point of this class, build histogram for tree nodes. */
-  void BuildHist(size_t page_id, common::BlockedSpace2d space, GHistIndexMatrix const &gidx,
-                 RegTree *p_tree, common::RowSetCollection const &row_set_collection,
-                 std::vector<ExpandEntry> const &nodes_for_explicit_hist_build,
-                 std::vector<ExpandEntry> const &nodes_for_subtraction_trick,
-                 std::vector<GradientPair> const &gpair) {
-    int starting_index = std::numeric_limits<int>::max();
-    int sync_count = 0;
-    if (page_id == 0) {
-      this->AddHistRows(&starting_index, &sync_count,
-                        nodes_for_explicit_hist_build,
-                        nodes_for_subtraction_trick, p_tree);
-    }
-    if (gidx.IsDense()) {
-      this->BuildLocalHistograms<false>(page_id, space, gidx,
-                                        nodes_for_explicit_hist_build,
-                                        row_set_collection, gpair);
-    } else {
-      this->BuildLocalHistograms<true>(page_id, space, gidx,
-                                       nodes_for_explicit_hist_build,
-                                       row_set_collection, gpair);
-    }
-
-    CHECK_GE(n_batches_, 1);
-    if (page_id != n_batches_ - 1) {
       return;
     }
 
-    if (is_distributed_) {
-      this->SyncHistogramDistributed(p_tree, nodes_for_explicit_hist_build,
-                                     nodes_for_subtraction_trick,
-                                     starting_index, sync_count);
-    } else {
-      this->SyncHistogramLocal(p_tree, nodes_for_explicit_hist_build,
-                               nodes_for_subtraction_trick, starting_index,
-                               sync_count);
+    // The cache is full, parent histogram might be removed in previous iterations to
+    // saved memory.
+    std::vector<bst_node_t> can_subtract;
+    for (auto const &v : nodes_to_sub) {
+      if (this->hist_.HistogramExists(tree.Parent(v))) {
+        // We can still use the subtraction trick for this node
+        can_subtract.push_back(v);
+      } else {
+        // This node requires a full build
+        nodes_to_build.push_back(v);
+      }
     }
-  }
-  /** same as the other build hist but handles only single batch data (in-core) */
-  void BuildHist(size_t page_id, GHistIndexMatrix const &gidx, RegTree *p_tree,
-                 common::RowSetCollection const &row_set_collection,
-                 std::vector<ExpandEntry> const &nodes_for_explicit_hist_build,
-                 std::vector<ExpandEntry> const &nodes_for_subtraction_trick,
-                 std::vector<GradientPair> const &gpair) {
-    const size_t n_nodes = nodes_for_explicit_hist_build.size();
-    // create space of size (# rows in each node)
-    common::BlockedSpace2d space(
-        n_nodes,
-        [&](size_t nidx_in_set) {
-          const int32_t nidx = nodes_for_explicit_hist_build[nidx_in_set].nid;
-          return row_set_collection[nidx].Size();
-        },
-        256);
-    this->BuildHist(page_id, space, gidx, p_tree, row_set_collection,
-                    nodes_for_explicit_hist_build, nodes_for_subtraction_trick,
-                    gpair);
+
+    nodes_to_sub = std::move(can_subtract);
+    this->hist_.AllocateHistograms(nodes_to_build, nodes_to_sub);
   }
 
-  void SyncHistogramDistributed(
-      RegTree *p_tree,
-      std::vector<ExpandEntry> const &nodes_for_explicit_hist_build,
-      std::vector<ExpandEntry> const &nodes_for_subtraction_trick,
-      int starting_index, int sync_count) {
-    const size_t nbins = builder_.GetNumBins();
+  /** Main entry point of this class, build histogram for tree nodes. */
+  void BuildHist(std::size_t page_idx, common::BlockedSpace2d const &space,
+                 GHistIndexMatrix const &gidx, common::RowSetCollection const &row_set_collection,
+                 std::vector<bst_node_t> const &nodes_to_build,
+                 linalg::VectorView<GradientPair const> gpair, bool read_by_column) {
+    monitor_.Start(__func__);
+    CHECK(gpair.Contiguous());
+
+    if (page_idx == 0) {
+      // Add the local histogram cache to the parallel buffer before processing the first page.
+      auto n_nodes = nodes_to_build.size();
+      std::vector<common::GHistRow> target_hists(n_nodes);
+      for (size_t i = 0; i < n_nodes; ++i) {
+        auto const nidx = nodes_to_build[i];
+        target_hists[i] = hist_[nidx];
+      }
+      buffer_.Reset(this->n_threads_, n_nodes, space, target_hists);
+    }
+
+    if (gidx.IsDense()) {
+      this->BuildLocalHistograms<false>(space, gidx, nodes_to_build, row_set_collection,
+                                        gpair.Values(), read_by_column);
+    } else {
+      this->BuildLocalHistograms<true>(space, gidx, nodes_to_build, row_set_collection,
+                                       gpair.Values(), read_by_column);
+    }
+    monitor_.Stop(__func__);
+  }
+
+  template <typename TreeView>
+  void SyncHistogram(Context const *ctx, TreeView const &tree,
+                     std::vector<bst_node_t> const &nodes_to_build,
+                     std::vector<bst_node_t> const &nodes_to_trick) {
+    auto n_total_bins = buffer_.TotalBins();
     common::BlockedSpace2d space(
-        nodes_for_explicit_hist_build.size(), [&](size_t) { return nbins; },
-        1024);
+        nodes_to_build.size(), [&](std::size_t) { return n_total_bins; }, 1024);
+    common::ParallelFor2d(space, this->n_threads_, [&](size_t node, common::Range1d r) {
+      // Merging histograms from each thread.
+      this->buffer_.ReduceHist(node, r.begin(), r.end());
+    });
+    if (is_distributed_) {
+      // The cache is contiguous, we can perform allreduce for all nodes in one go.
+      CHECK(!nodes_to_build.empty());
+      auto first_nidx = nodes_to_build.front();
+      std::size_t n = n_total_bins * nodes_to_build.size() * 2;
+      auto rc = collective::Allreduce(
+          ctx, linalg::MakeVec(reinterpret_cast<double *>(this->hist_[first_nidx].data()), n),
+          collective::Op::kSum);
+      SafeColl(rc);
+    }
+
+    common::BlockedSpace2d const &subspace =
+        nodes_to_trick.size() == nodes_to_build.size()
+            ? space
+            : common::BlockedSpace2d{nodes_to_trick.size(),
+                                     [&](std::size_t) { return n_total_bins; }, 1024};
     common::ParallelFor2d(
-        space, n_threads_, [&](size_t node, common::Range1d r) {
-          const auto &entry = nodes_for_explicit_hist_build[node];
-          auto this_hist = this->hist_[entry.nid];
-          // Merging histograms from each thread into once
-          buffer_.ReduceHist(node, r.begin(), r.end());
-          // Store posible parent node
-          auto this_local = hist_local_worker_[entry.nid];
-          common::CopyHist(this_local, this_hist, r.begin(), r.end());
-
-          if (!(*p_tree)[entry.nid].IsRoot()) {
-            const size_t parent_id = (*p_tree)[entry.nid].Parent();
-            const int subtraction_node_id =
-                nodes_for_subtraction_trick[node].nid;
-            auto parent_hist = this->hist_local_worker_[parent_id];
-            auto sibling_hist = this->hist_[subtraction_node_id];
-            common::SubtractionHist(sibling_hist, parent_hist, this_hist,
-                                    r.begin(), r.end());
-            // Store posible parent node
-            auto sibling_local = hist_local_worker_[subtraction_node_id];
-            common::CopyHist(sibling_local, sibling_hist, r.begin(), r.end());
-          }
-        });
-
-    reducer_.Allreduce(this->hist_[starting_index].data(),
-                       builder_.GetNumBins() * sync_count);
-
-    ParallelSubtractionHist(space, nodes_for_explicit_hist_build,
-                            nodes_for_subtraction_trick, p_tree);
-
-    common::BlockedSpace2d space2(
-        nodes_for_subtraction_trick.size(), [&](size_t) { return nbins; },
-        1024);
-    ParallelSubtractionHist(space2, nodes_for_subtraction_trick,
-                            nodes_for_explicit_hist_build, p_tree);
-  }
-
-  void SyncHistogramLocal(
-      RegTree *p_tree,
-      std::vector<ExpandEntry> const &nodes_for_explicit_hist_build,
-      std::vector<ExpandEntry> const &nodes_for_subtraction_trick,
-      int starting_index, int sync_count) {
-    const size_t nbins = this->builder_.GetNumBins();
-    common::BlockedSpace2d space(
-        nodes_for_explicit_hist_build.size(), [&](size_t) { return nbins; },
-        1024);
-
-    common::ParallelFor2d(
-        space, this->n_threads_, [&](size_t node, common::Range1d r) {
-          const auto &entry = nodes_for_explicit_hist_build[node];
-          auto this_hist = this->hist_[entry.nid];
-          // Merging histograms from each thread into once
-          this->buffer_.ReduceHist(node, r.begin(), r.end());
-
-          if (!(*p_tree)[entry.nid].IsRoot()) {
-            const size_t parent_id = (*p_tree)[entry.nid].Parent();
-            const int subtraction_node_id =
-                nodes_for_subtraction_trick[node].nid;
-            auto parent_hist = this->hist_[parent_id];
-            auto sibling_hist = this->hist_[subtraction_node_id];
-            common::SubtractionHist(sibling_hist, parent_hist, this_hist,
-                                    r.begin(), r.end());
-          }
+        subspace, this->n_threads_, [&](std::size_t nidx_in_set, common::Range1d r) {
+          auto subtraction_nidx = nodes_to_trick[nidx_in_set];
+          auto parent_id = tree.Parent(subtraction_nidx);
+          auto sibling_nidx = tree.IsLeftChild(subtraction_nidx) ? tree.RightChild(parent_id)
+                                                                 : tree.LeftChild(parent_id);
+          auto sibling_hist = this->hist_[sibling_nidx];
+          auto parent_hist = this->hist_[parent_id];
+          auto subtract_hist = this->hist_[subtraction_nidx];
+          common::SubtractionHist(subtract_hist, parent_hist, sibling_hist, r.begin(), r.end());
         });
   }
 
  public:
   /* Getters for tests. */
-  common::HistCollection<GradientSumT> const& Histogram() {
-    return hist_;
-  }
-  auto& Buffer() { return buffer_; }
+  [[nodiscard]] BoundedHistCollection const &Histogram() const { return hist_; }
+  [[nodiscard]] BoundedHistCollection &Histogram() { return hist_; }
+  auto &Buffer() { return buffer_; }
+};
 
- private:
-  void
-  ParallelSubtractionHist(const common::BlockedSpace2d &space,
-                          const std::vector<ExpandEntry> &nodes,
-                          const std::vector<ExpandEntry> &subtraction_nodes,
-                          const RegTree *p_tree) {
-    common::ParallelFor2d(
-        space, this->n_threads_, [&](size_t node, common::Range1d r) {
-          const auto &entry = nodes[node];
-          if (!((*p_tree)[entry.nid].IsLeftChild())) {
-            auto this_hist = this->hist_[entry.nid];
-
-            if (!(*p_tree)[entry.nid].IsRoot()) {
-              const int subtraction_node_id = subtraction_nodes[node].nid;
-              auto parent_hist = hist_[(*p_tree)[entry.nid].Parent()];
-              auto sibling_hist = hist_[subtraction_node_id];
-              common::SubtractionHist(this_hist, parent_hist, sibling_hist,
-                                      r.begin(), r.end());
-            }
-          }
-        });
+// Construct a work space for building histogram.  Eventually we should move this
+// function into histogram builder once hist tree method supports external memory.
+template <typename Partitioner>
+common::BlockedSpace2d ConstructHistSpace(Partitioner const &partitioners,
+                                          std::vector<bst_node_t> const &nodes_to_build,
+                                          const GHistIndexMatrix &gidx, std::size_t l1_size,
+                                          bst_bin_t max_bin, bool read_by_column) {
+  // FIXME(jiamingy): Handle different size of space.  Right now we use the maximum
+  // partition size for the buffer, which might not be efficient if partition sizes
+  // has significant variance.
+  std::vector<std::size_t> partition_size(nodes_to_build.size(), 0);
+  for (auto const &partition : partitioners) {
+    size_t k = 0;
+    for (auto nidx : nodes_to_build) {
+      auto n_rows_in_node = partition.Partitions()[nidx].Size();
+      partition_size[k] = std::max(partition_size[k], n_rows_in_node);
+      k++;
+    }
   }
 
-  // Add a tree node to histogram buffer in local training environment.
-  void AddHistRowsLocal(
-      int *starting_index, int *sync_count,
-      std::vector<ExpandEntry> const &nodes_for_explicit_hist_build,
-      std::vector<ExpandEntry> const &nodes_for_subtraction_trick) {
-    for (auto const &entry : nodes_for_explicit_hist_build) {
-      int nid = entry.nid;
-      this->hist_.AddHistRow(nid);
-      (*starting_index) = std::min(nid, (*starting_index));
-    }
-    (*sync_count) = nodes_for_explicit_hist_build.size();
+  // Estimate the size of each data block based on model parameters and L1 capacity
+  // The general idea is to keep as much working-set data in L1 as possible.
+  /* Each processed row occupies ~32 bytes in L1:
+   * - gradient pair (p_gpair): sizeof(GradientPair)
+   * - row index (rid[i]): sizeof(size_t)
+   * - icol_start and icol_end: 2 * sizeof(size_t)
+   */
+  std::size_t l1_row_foot_print = (sizeof(GradientPair) + 3 * sizeof(size_t));
+  double usable_l1_size = 0.8 * l1_size;
 
-    for (auto const &node : nodes_for_subtraction_trick) {
-      this->hist_.AddHistRow(node.nid);
-    }
-    this->hist_.AllocateAllData();
+  std::size_t space_in_l1_for_rows;
+  if (read_by_column) {
+    /* In this case, an accurate block_size estimate is performance-critical.
+    * For column-wise histogram construction, each column is processed over the
+    * same block of rows. If the block fits in L1, the row data are loaded once
+    * and reused across all columns; otherwise, the cache must be refilled for
+    * each column.
+    */
+
+    /* First step: determine whether one histogram column fits into L1.
+     * Note: column-wise kernel is used for dense data only.
+     */
+    std::size_t hist_col_size = 2 * sizeof(GradientPairPrecise) * max_bin;
+    bool hist_col_fit_to_l1 = hist_col_size < usable_l1_size;
+
+    /* Second step: compute available L1 space for row data. */
+    space_in_l1_for_rows = usable_l1_size - (hist_col_fit_to_l1 ? hist_col_size : 0);
+  } else {
+    /* In this case, block_size is less critical.
+    * For row-wise histogram construction, columns are processed for each row.
+    * Rows do not need to remain in L1 across iterations, but choosing a
+    * reasonable block_size allows the histogram buffer and offsets to stay in L1,
+    * which gives a small performance benefit.
+    */
+
+    /* First step: estimate the size of the histogram and the offsets vector. */
+    std::size_t n_bins = gidx.cut.Ptrs().back();
+    std::size_t n_columns = gidx.cut.Ptrs().size() - 1;
+    bool any_missing = !gidx.IsDense();
+    std::size_t hist_size = 2 * sizeof(GradientPairPrecise) * n_bins;
+    std::size_t offsets_size = any_missing ? 0 : n_columns * sizeof(uint32_t);
+
+    /* Second step: estimate the extra L1 footprint caused by prefetching.
+     * Prefetching is not always active, so the estimate is intentionally conservative.
+     */
+    l1_row_foot_print += sizeof(GradientPair);
+    std::size_t idx_bin_size = n_columns * sizeof(uint32_t);
+
+    bool hist_fit_to_l1 = (hist_size + offsets_size + idx_bin_size) < usable_l1_size;
+
+    /* Third step: compute available L1 space for row data. */
+    std::size_t occupied_space = (hist_fit_to_l1 ? hist_size : 0) + offsets_size + idx_bin_size;
+    space_in_l1_for_rows = usable_l1_size > occupied_space ? usable_l1_size - occupied_space : 0;
+  }
+  std::size_t block_size = space_in_l1_for_rows / l1_row_foot_print;
+
+  /* Minimum block size = 8 rows.
+   * This ensures that a full cache line is utilized when loading gradient pairs.
+   */
+  constexpr std::size_t kCacheLineSize = 64;
+  constexpr std::size_t kMinBlockSize = kCacheLineSize / sizeof(GradientPair);
+  block_size = std::max<std::size_t>(kMinBlockSize, block_size);
+
+  common::BlockedSpace2d space{nodes_to_build.size(),
+                               [&](size_t nidx_in_set) { return partition_size[nidx_in_set]; },
+                               block_size};
+  return space;
+}
+
+/**
+ * @brief Histogram builder that can handle multiple targets.
+ */
+class MultiHistogramBuilder {
+  std::vector<HistogramBuilder> target_builders_;
+  Context const *ctx_;
+  common::CacheManager cache_manager_;
+
+  bool ReadByColumn(const GHistIndexMatrix &gidx, bool force_read_by_column) const {
+    if (force_read_by_column) return true;
+
+    auto nbins = gidx.cut.Ptrs().back();
+    size_t hist_size = 2 * sizeof(double) * nbins;
+
+    double l3_per_thread = static_cast<double>(cache_manager_.L3Size()) / ctx_->Threads();
+    double usable_cache_size = 0.8 * (cache_manager_.L2Size() + l3_per_thread);
+    const bool hist_fit_to_l2 = usable_cache_size > hist_size;
+
+    /* In row-wise histogram construction, each iteration of the outer (row-wise) loop
+     * accesses bins across the entire histogram; the bins are not localized.
+     * If the histogram is too large to fit in L2 cache, random access becomes a major performance bottleneck.
+     *
+     * or dense data, using column-wise histogram construction,
+     * each iteration of the outer (column-wise) loop accesses only a localized portion of the histogram:
+     * idx_bin = gradient_index(row_id, col_id) + offset[col_id].
+     * This improves cache locality, so the column-wise kernel outperforms the row-wise kernel in this case.
+     */
+    bool read_by_column = !hist_fit_to_l2 && gidx.IsDense();
+    return read_by_column;
   }
 
-  void AddHistRowsDistributed(
-      int *starting_index, int *sync_count,
-      std::vector<ExpandEntry> const &nodes_for_explicit_hist_build,
-      std::vector<ExpandEntry> const &nodes_for_subtraction_trick,
-      RegTree *p_tree) {
-    const size_t explicit_size = nodes_for_explicit_hist_build.size();
-    const size_t subtaction_size = nodes_for_subtraction_trick.size();
-    std::vector<int> merged_node_ids(explicit_size + subtaction_size);
-    for (size_t i = 0; i < explicit_size; ++i) {
-      merged_node_ids[i] = nodes_for_explicit_hist_build[i].nid;
+ public:
+  /**
+   * @brief Build the histogram for root node.
+   */
+  template <typename Partitioner, typename ExpandEntry, typename TreeView>
+  void BuildRootHist(DMatrix *p_fmat, TreeView const &tree,
+                     std::vector<Partitioner> const &partitioners,
+                     linalg::MatrixView<GradientPair const> gpair, ExpandEntry const &best,
+                     BatchParam const &param, bool force_read_by_column = false) {
+    auto n_targets = gpair.Shape(1);
+    CHECK_EQ(p_fmat->Info().num_row_, gpair.Shape(0));
+    CHECK_EQ(target_builders_.size(), n_targets);
+    std::vector<bst_node_t> nodes{best.nid};
+    std::vector<bst_node_t> dummy_sub;
+
+    for (bst_target_t t{0}; t < n_targets; ++t) {
+      this->target_builders_[t].AddHistRows(tree, &nodes, &dummy_sub, false);
     }
-    for (size_t i = 0; i < subtaction_size; ++i) {
-      merged_node_ids[explicit_size + i] = nodes_for_subtraction_trick[i].nid;
-    }
-    std::sort(merged_node_ids.begin(), merged_node_ids.end());
-    int n_left = 0;
-    for (auto const &nid : merged_node_ids) {
-      if ((*p_tree)[nid].IsLeftChild()) {
-        this->hist_.AddHistRow(nid);
-        (*starting_index) = std::min(nid, (*starting_index));
-        n_left++;
-        this->hist_local_worker_.AddHistRow(nid);
+    CHECK(dummy_sub.empty());
+
+    std::size_t page_idx{0};
+    for (auto const &gidx : p_fmat->GetBatches<GHistIndexMatrix>(ctx_, param)) {
+      bool read_by_column = ReadByColumn(gidx, force_read_by_column);
+
+      auto space = ConstructHistSpace(partitioners, nodes, gidx, cache_manager_.L1Size(),
+                                      param.max_bin, read_by_column);
+      for (bst_target_t t{0}; t < n_targets; ++t) {
+        auto t_gpair = gpair.Slice(linalg::All(), t);
+        this->target_builders_[t].BuildHist(page_idx, space, gidx,
+                                            partitioners[page_idx].Partitions(), nodes, t_gpair,
+                                            read_by_column);
       }
+      ++page_idx;
     }
-    for (auto const &nid : merged_node_ids) {
-      if (!((*p_tree)[nid].IsLeftChild())) {
-        this->hist_.AddHistRow(nid);
-        this->hist_local_worker_.AddHistRow(nid);
+
+    for (bst_target_t t = 0; t < n_targets; ++t) {
+      this->target_builders_[t].SyncHistogram(ctx_, tree, nodes, dummy_sub);
+    }
+  }
+  /**
+   * @brief Build histogram for left and right child of valid candidates
+   */
+  template <typename Partitioner, typename ExpandEntry, typename TreeView>
+  void BuildHistLeftRight(Context const *ctx, DMatrix *p_fmat, TreeView const &tree,
+                          std::vector<Partitioner> const &partitioners,
+                          std::vector<ExpandEntry> const &valid_candidates,
+                          linalg::MatrixView<GradientPair const> gpair, BatchParam const &param,
+                          bool force_read_by_column = false) {
+    std::vector<bst_node_t> nodes_to_build(valid_candidates.size());
+    std::vector<bst_node_t> nodes_to_sub(valid_candidates.size());
+    AssignNodes(tree, valid_candidates, nodes_to_build, nodes_to_sub);
+
+    // use the first builder for getting number of valid nodes.
+    target_builders_.front().AddHistRows(tree, &nodes_to_build, &nodes_to_sub, true);
+    CHECK_GE(nodes_to_build.size(), nodes_to_sub.size());
+    CHECK_EQ(nodes_to_sub.size() + nodes_to_build.size(), valid_candidates.size() * 2);
+
+    // allocate storage for the rest of the builders
+    for (bst_target_t t = 1; t < target_builders_.size(); ++t) {
+      target_builders_[t].AddHistRows(tree, &nodes_to_build, &nodes_to_sub, false);
+    }
+
+    std::size_t page_idx{0};
+    for (auto const &page : p_fmat->GetBatches<GHistIndexMatrix>(ctx_, param)) {
+      bool read_by_column = ReadByColumn(page, force_read_by_column);
+
+      auto space = ConstructHistSpace(partitioners, nodes_to_build, page, cache_manager_.L1Size(),
+                                      param.max_bin, read_by_column);
+
+      auto n_targets = gpair.Shape(1);
+      for (bst_target_t t = 0; t < n_targets; ++t) {
+        auto t_gpair = gpair.Slice(linalg::All(), t);
+        CHECK_EQ(t_gpair.Shape(0), p_fmat->Info().num_row_);
+        this->target_builders_[t].BuildHist(page_idx, space, page,
+                                            partitioners[page_idx].Partitions(), nodes_to_build,
+                                            t_gpair, read_by_column);
       }
+      page_idx++;
     }
-    this->hist_.AllocateAllData();
-    this->hist_local_worker_.AllocateAllData();
-    (*sync_count) = std::max(1, n_left);
+
+    auto n_targets = gpair.Shape(1);
+    for (bst_target_t t = 0; t < n_targets; ++t) {
+      this->target_builders_[t].SyncHistogram(ctx, tree, nodes_to_build, nodes_to_sub);
+    }
+  }
+
+  [[nodiscard]] auto const &Histogram(bst_target_t t) const {
+    return target_builders_[t].Histogram();
+  }
+  [[nodiscard]] auto &Histogram(bst_target_t t) { return target_builders_[t].Histogram(); }
+  // Number of targets for histogram building (may differ from tree.NumTargets() for reduced grad)
+  [[nodiscard]] bst_target_t NumTargets() const { return target_builders_.size(); }
+
+  void Reset(Context const *ctx, bst_bin_t total_bins, bst_target_t n_targets, BatchParam const &p,
+             bool is_distributed, HistMakerTrainParam const *param) {
+    ctx_ = ctx;
+    target_builders_.resize(n_targets);
+    CHECK_GE(n_targets, 1);
+    for (auto &v : target_builders_) {
+      v.Reset(ctx, total_bins, p, is_distributed, param);
+    }
   }
 };
-}      // namespace tree
-}      // namespace xgboost
+}  // namespace xgboost::tree
 #endif  // XGBOOST_TREE_HIST_HISTOGRAM_H_

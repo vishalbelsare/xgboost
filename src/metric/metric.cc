@@ -1,11 +1,11 @@
-/*!
- * Copyright 2015-2020 by Contributors
+/**
+ * Copyright 2015-2023 by XGBoost Contributors
  * \file metric_registry.cc
  * \brief Registry of objective functions.
  */
 #include <dmlc/registry.h>
+#include <xgboost/context.h>
 #include <xgboost/metric.h>
-#include <xgboost/generic_parameters.h>
 
 #include "metric_common.h"
 
@@ -25,7 +25,7 @@ Metric* CreateMetricImpl(const std::string& name) {
       prefix = buf;
       param = nullptr;
     }
-    auto *e = ::dmlc::Registry<MetricRegistry>::Get()->Find(prefix.c_str());
+    auto* e = ::dmlc::Registry<MetricRegistry>::Get()->Find(prefix.c_str());
     if (e == nullptr) {
       return nullptr;
     }
@@ -33,7 +33,7 @@ Metric* CreateMetricImpl(const std::string& name) {
     return p_metric;
   } else {
     std::string prefix = buf.substr(0, pos);
-    auto *e = ::dmlc::Registry<MetricRegistry>::Get()->Find(prefix.c_str());
+    auto* e = ::dmlc::Registry<MetricRegistry>::Get()->Find(prefix.c_str());
     if (e == nullptr) {
       return nullptr;
     }
@@ -42,48 +42,53 @@ Metric* CreateMetricImpl(const std::string& name) {
   }
 }
 
-Metric *
-Metric::Create(const std::string& name, GenericParameter const* tparam) {
+Metric* Metric::Create(const std::string& name, Context const* ctx) {
   auto metric = CreateMetricImpl<MetricReg>(name);
   if (metric == nullptr) {
     LOG(FATAL) << "Unknown metric function " << name;
   }
 
-  metric->tparam_ = tparam;
-  return metric;
-}
-
-Metric *
-GPUMetric::CreateGPUMetric(const std::string& name, GenericParameter const* tparam) {
-  auto metric = CreateMetricImpl<MetricGPUReg>(name);
-  if (metric == nullptr) {
-    LOG(WARNING) << "Cannot find a GPU metric builder for metric " << name
-                 << ". Resorting to the CPU builder";
-    return metric;
-  }
-
-  // Narrowing reference only for the compiler to allow assignment to a base class member.
-  // As such, using this narrowed reference to refer to derived members will be an illegal op.
-  // This is moot, as this type is stateless.
-  static_cast<GPUMetric *>(metric)->tparam_ = tparam;
+  metric->ctx_ = ctx;
   return metric;
 }
 }  // namespace xgboost
 
 namespace dmlc {
 DMLC_REGISTRY_ENABLE(::xgboost::MetricReg);
-DMLC_REGISTRY_ENABLE(::xgboost::MetricGPUReg);
 }
 
-namespace xgboost {
-namespace metric {
+namespace xgboost::metric {
 // List of files that will be force linked in static links.
-DMLC_REGISTRY_LINK_TAG(elementwise_metric);
+DMLC_REGISTRY_LINK_TAG(auc);
+DMLC_REGISTRY_LINK_TAG(quantile_metric);
+DMLC_REGISTRY_LINK_TAG(expectile_metric);
+DMLC_REGISTRY_LINK_TAG(rmse_metric);
+DMLC_REGISTRY_LINK_TAG(mae_metric);
+DMLC_REGISTRY_LINK_TAG(logloss_metric);
+DMLC_REGISTRY_LINK_TAG(pseudohuber_metric);
+DMLC_REGISTRY_LINK_TAG(error_metric);
+DMLC_REGISTRY_LINK_TAG(poisson_metric);
+DMLC_REGISTRY_LINK_TAG(gamma_metric);
+DMLC_REGISTRY_LINK_TAG(tweedie_metric);
+DMLC_REGISTRY_LINK_TAG(normal_metric);
 DMLC_REGISTRY_LINK_TAG(multiclass_metric);
 DMLC_REGISTRY_LINK_TAG(survival_metric);
 DMLC_REGISTRY_LINK_TAG(rank_metric);
 #ifdef XGBOOST_USE_CUDA
+DMLC_REGISTRY_LINK_TAG(auc_gpu);
+DMLC_REGISTRY_LINK_TAG(survival_metric_cuda);
+DMLC_REGISTRY_LINK_TAG(quantile_metric_cuda);
+DMLC_REGISTRY_LINK_TAG(expectile_metric_cuda);
+DMLC_REGISTRY_LINK_TAG(multiclass_metric_cuda);
+DMLC_REGISTRY_LINK_TAG(rmse_metric_cuda);
+DMLC_REGISTRY_LINK_TAG(mae_metric_cuda);
+DMLC_REGISTRY_LINK_TAG(logloss_metric_cuda);
+DMLC_REGISTRY_LINK_TAG(pseudohuber_metric_cuda);
+DMLC_REGISTRY_LINK_TAG(error_metric_cuda);
+DMLC_REGISTRY_LINK_TAG(poisson_metric_cuda);
+DMLC_REGISTRY_LINK_TAG(gamma_metric_cuda);
+DMLC_REGISTRY_LINK_TAG(tweedie_metric_cuda);
+DMLC_REGISTRY_LINK_TAG(normal_metric_cuda);
 DMLC_REGISTRY_LINK_TAG(rank_metric_gpu);
 #endif
-}  // namespace metric
-}  // namespace xgboost
+}  // namespace xgboost::metric

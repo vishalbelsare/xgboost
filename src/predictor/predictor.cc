@@ -1,105 +1,95 @@
-/*!
- * Copyright 2017-2021 by Contributors
+/**
+ * Copyright 2017-2025, XGBoost Contributors
  */
-#include <dmlc/registry.h>
-#include <mutex>
+#include <dmlc/registry.h>  // for DMLC_REGISTRY_LINK_TAG
 
-#include "xgboost/predictor.h"
-#include "xgboost/data.h"
-#include "xgboost/generic_parameters.h"
+#include <cstdint>  // for int32_t
+#include <string>   // for string, to_string
 
-#include "../gbm/gbtree.h"
+#include "../common/kernel.h"
+#include "../gbm/gbtree_model.h"  // for GBTreeModel
+#include "prediction_kernel.h"
+#include "xgboost/base.h"                // for bst_group_t, bst_idx_t
+#include "xgboost/context.h"             // for Context
+#include "xgboost/data.h"                // for MetaInfo
+#include "xgboost/host_device_vector.h"  // for HostDeviceVector
+#include "xgboost/learner.h"             // for LearnerModelState
+#include "xgboost/linalg.h"              // for Tensor, TensorView
+#include "xgboost/logging.h"             // for CHECK_EQ, CHECK_NE, LOG
 
-namespace dmlc {
-DMLC_REGISTRY_ENABLE(::xgboost::PredictorReg);
-}  // namespace dmlc
-
-namespace xgboost {
-void PredictionContainer::ClearExpiredEntries() {
-  std::vector<DMatrix*> expired;
-  for (auto& kv : container_) {
-    if (kv.second.ref.expired()) {
-      expired.emplace_back(kv.first);
-    }
-  }
-  for (auto const& ptr : expired) {
-    container_.erase(ptr);
-  }
-}
-
-PredictionCacheEntry &PredictionContainer::Cache(std::shared_ptr<DMatrix> m, int32_t device) {
-  this->ClearExpiredEntries();
-  container_[m.get()].ref = m;
-  if (device != GenericParameter::kCpuId) {
-    container_[m.get()].predictions.SetDevice(device);
-  }
-  return container_[m.get()];
-}
-
-PredictionCacheEntry &PredictionContainer::Entry(DMatrix *m) {
-  CHECK(container_.find(m) != container_.cend());
-  CHECK(container_.at(m).ref.lock())
-      << "[Internal error]: DMatrix: " << m << " has expired.";
-  return container_.at(m);
-}
-
-decltype(PredictionContainer::container_) const& PredictionContainer::Container() {
-  this->ClearExpiredEntries();
-  return container_;
-}
-
-void Predictor::Configure(
-    const std::vector<std::pair<std::string, std::string>>&) {
-}
-Predictor* Predictor::Create(
-    std::string const& name, GenericParameter const* generic_param) {
-  auto* e = ::dmlc::Registry<PredictorReg>::Get()->Find(name);
-  if (e == nullptr) {
-    LOG(FATAL) << "Unknown predictor type " << name;
-  }
-  auto p_predictor = (e->body)(generic_param);
-  return p_predictor;
-}
-
-void ValidateBaseMarginShape(linalg::Tensor<float, 3> const& margin, bst_row_t n_samples,
+namespace xgboost::predictor {
+namespace {
+template <int32_t D>
+void ValidateBaseMarginShape(linalg::Tensor<float, D> const& margin, bst_idx_t n_samples,
                              bst_group_t n_groups) {
-  // FIXME: Bindings other than Python doesn't have shape.
+  // FIXME: Bindings other than Python and R don't have shape.
   std::string expected{"Invalid shape of base_margin. Expected: (" + std::to_string(n_samples) +
                        ", " + std::to_string(n_groups) + ")"};
   CHECK_EQ(margin.Shape(0), n_samples) << expected;
   CHECK_EQ(margin.Shape(1), n_groups) << expected;
 }
 
-void Predictor::InitOutPredictions(const MetaInfo& info, HostDeviceVector<bst_float>* out_preds,
-                                   const gbm::GBTreeModel& model) const {
-  CHECK_NE(model.learner_model_param->num_output_group, 0);
-  size_t n_classes = model.learner_model_param->num_output_group;
-  size_t n = n_classes * info.num_row_;
-  const HostDeviceVector<bst_float>* base_margin = info.base_margin_.Data();
-  if (generic_param_->gpu_id >= 0) {
-    out_preds->SetDevice(generic_param_->gpu_id);
-  }
-  if (base_margin->Size() != 0) {
-    out_preds->Resize(n);
-    ValidateBaseMarginShape(info.base_margin_, info.num_row_, n_classes);
-    out_preds->Copy(*base_margin);
-  } else {
-    if (out_preds->Empty()) {
-      out_preds->Resize(n, model.learner_model_param->base_score);
-    } else {
-      out_preds->Resize(n);
-      out_preds->Fill(model.learner_model_param->base_score);
+void InitBaseScoreCPU(Context const* ctx, linalg::VectorView<float const> base_score,
+                      linalg::MatrixView<float> predt) {
+  common::ParallelFor(predt.Shape(0), ctx->Threads(), [&](auto i) {
+    for (std::size_t j = 0, m = predt.Shape(1); j < m; ++j) {
+      predt(i, j) = base_score(j);
     }
-  }
+  });
 }
-}  // namespace xgboost
 
-namespace xgboost {
-namespace predictor {
+common::KernelRegistration<InitBaseScoreKernel> const kInitBaseScoreCPU{DeviceOrd::kCPU,
+                                                                        &InitBaseScoreCPU};
+}  // namespace
+
+void InitOutPredictions(Context const* ctx, MetaInfo const& info,
+                        HostDeviceVector<float>* out_preds, gbm::GBTreeModel const& model) {
+  CHECK_NE(model.learner_model_state->num_output_group, 0);
+
+  if (!ctx->Device().IsCPU()) {
+    out_preds->SetDevice(ctx->Device());
+  }
+
+  // Cannot rely on the Resize to fill as it might skip if the size is already correct.
+  auto n = static_cast<size_t>(model.learner_model_state->OutputLength() * info.num_row_);
+  out_preds->Resize(n);
+
+  HostDeviceVector<float> const* base_margin = info.base_margin_.Data();
+  if (!base_margin->Empty()) {
+    ValidateBaseMarginShape(info.base_margin_, info.num_row_,
+                            model.learner_model_state->OutputLength());
+    out_preds->Copy(*base_margin);
+    return;
+  }
+
+  auto base_score = model.learner_model_state->BaseScore(ctx->Device());
+  if (base_score.Size() == 1) {
+    // Fill a scalar
+    out_preds->Fill(model.learner_model_state->BaseScore(DeviceOrd::CPU())(0));
+    return;
+  }
+
+  // Handle multi-output models where base_score is a vector.
+  auto predt = linalg::MakeTensorView(ctx, out_preds, info.num_row_,
+                                      model.learner_model_state->OutputLength());
+  CHECK_EQ(predt.Size(), out_preds->Size());
+
+  common::DispatchKernel<InitBaseScoreKernel>(ctx, base_score, predt);
+}
+
 // List of files that will be force linked in static links.
 #ifdef XGBOOST_USE_CUDA
 DMLC_REGISTRY_LINK_TAG(gpu_predictor);
+DMLC_REGISTRY_LINK_TAG(prediction_cuda);
 #endif  // XGBOOST_USE_CUDA
 DMLC_REGISTRY_LINK_TAG(cpu_predictor);
-}  // namespace predictor
-}  // namespace xgboost
+}  // namespace xgboost::predictor
+
+namespace xgboost::interpretability {
+DMLC_REGISTRY_LINK_TAG(shap_cpu);
+#ifdef XGBOOST_USE_CUDA
+namespace cuda_impl {
+DMLC_REGISTRY_LINK_TAG(shap_cuda);
+}  // namespace cuda_impl
+#endif  // XGBOOST_USE_CUDA
+}  // namespace xgboost::interpretability

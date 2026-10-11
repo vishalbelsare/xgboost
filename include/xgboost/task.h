@@ -1,10 +1,10 @@
-/*!
- * Copyright 2021 by XGBoost Contributors
+/**
+ * Copyright 2021-2024, XGBoost Contributors
  */
 #ifndef XGBOOST_TASK_H_
 #define XGBOOST_TASK_H_
 
-#include <cinttypes>
+#include <cstdint>  // for uint8_t
 
 namespace xgboost {
 /*!
@@ -21,7 +21,7 @@ namespace xgboost {
  */
 struct ObjInfo {
   // What kind of problem are we trying to solve
-  enum Task : uint8_t {
+  enum Task : std::uint8_t {
     kRegression = 0,
     kBinary = 1,
     kClassification = 2,
@@ -32,7 +32,7 @@ struct ObjInfo {
   // Does the objective have constant hessian value?
   bool const_hess{false};
 
-  explicit ObjInfo(Task t) : task{t} {}
+  ObjInfo(Task t) : task{t} {}  // NOLINT
   ObjInfo(Task t, bool khess) : task{t}, const_hess{khess} {}
 };
 }  // namespace xgboost

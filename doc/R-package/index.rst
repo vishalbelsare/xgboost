@@ -9,20 +9,38 @@ XGBoost R Package
 
 You have found the XGBoost R Package!
 
-***********
-Get Started
-***********
-* Checkout the :doc:`Installation Guide </install>` contains instructions to install xgboost, and :doc:`Tutorials </tutorials/index>` for examples on how to use XGBoost for various tasks.
-* Read the `API documentation <https://cran.r-project.org/web/packages/xgboost/xgboost.pdf>`_.
-* Please visit `Walk-through Examples <https://github.com/dmlc/xgboost/tree/master/R-package/demo>`_.
-
-*********
-Tutorials
-*********
-
 .. toctree::
   :maxdepth: 2
   :titlesonly:
 
-  Introduction to XGBoost in R <xgboostPresentation>
-  Understanding your dataset with XGBoost <discoverYourData>
+***********
+Get Started
+***********
+
+Since XGBoost 3.0.0, the latest R package is available on `R-universe
+<https://dmlc.r-universe.dev/xgboost>`__ in addition to the CRAN package.
+
+* Check out the :doc:`Installation Guide </install>` for instructions on how to install
+  xgboost, and :doc:`Tutorials </tutorials/index>` for examples on how to use XGBoost for
+  various tasks.
+* Read the latest `API documentation <../r_docs/R-package/docs/reference/index.html>`__.
+* Read the `CRAN documentation <https://cran.r-project.org/web/packages/xgboost/xgboost.pdf>`__.
+
+*********
+Vignettes
+*********
+
+.. toctree::
+
+  xgboost_introduction
+  xgboostfromJSON
+
+************
+Other topics
+************
+
+.. toctree::
+
+  Migrating code from previous XGBoost versions <migration_guide>
+  Handling of indexable elements <index_base>
+  Developer guide: parameters from core library <adding_parameters>

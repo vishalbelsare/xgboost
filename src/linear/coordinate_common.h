@@ -1,20 +1,21 @@
-/*!
- * Copyright 2018 by Contributors
+/**
+ * Copyright 2018-2026, XGBoost Contributors
  * \author Rory Mitchell
  */
 #pragma once
 #include <algorithm>
+#include <cmath>  // for fpclassify
+#include <limits>
+#include <numeric>  // for accumulate, iota
 #include <string>
 #include <utility>
 #include <vector>
-#include <limits>
 
+#include "../common/threading_utils.h"
+#include "../gbm/gblinear_model.h"
+#include "./param.h"
 #include "xgboost/data.h"
 #include "xgboost/parameter.h"
-#include "./param.h"
-#include "../gbm/gblinear_model.h"
-#include "../common/random.h"
-#include "../common/threading_utils.h"
 
 namespace xgboost {
 namespace linear {
@@ -22,11 +23,9 @@ namespace linear {
 struct CoordinateParam : public XGBoostParameter<CoordinateParam> {
   int top_k;
   DMLC_DECLARE_PARAMETER(CoordinateParam) {
-    DMLC_DECLARE_FIELD(top_k)
-        .set_lower_bound(0)
-        .set_default(0)
-        .describe("The number of top features to select in 'thrifty' feature_selector. "
-                  "The value of zero means using all the features.");
+    DMLC_DECLARE_FIELD(top_k).set_lower_bound(0).set_default(0).describe(
+        "The number of top features to select in 'thrifty' feature_selector. "
+        "The value of zero means using all the features.");
   }
 };
 
@@ -42,8 +41,8 @@ struct CoordinateParam : public XGBoostParameter<CoordinateParam> {
  *
  * \return  The weight update.
  */
-inline double CoordinateDelta(double sum_grad, double sum_hess, double w,
-                              double reg_alpha, double reg_lambda) {
+inline double CoordinateDelta(double sum_grad, double sum_hess, double w, double reg_alpha,
+                              double reg_lambda) {
   if (sum_hess < 1e-5f) return 0.0f;
   const double sum_grad_l2 = sum_grad + reg_lambda * w;
   const double sum_hess_l2 = sum_hess + reg_lambda;
@@ -64,7 +63,11 @@ inline double CoordinateDelta(double sum_grad, double sum_hess, double w,
  * \return  The weight update.
  */
 inline double CoordinateDeltaBias(double sum_grad, double sum_hess) {
-  return -sum_grad / sum_hess;
+  auto b = -sum_grad / sum_hess;
+  if (std::isnan(b) || std::isinf(b)) {
+    b = 0;
+  }
+  return b;
 }
 
 /**
@@ -78,11 +81,12 @@ inline double CoordinateDeltaBias(double sum_grad, double sum_hess) {
  *
  * \return  The gradient and diagonal Hessian entry for a given feature.
  */
-inline std::pair<double, double> GetGradient(int group_idx, int num_group, int fidx,
-                                             const std::vector<GradientPair> &gpair,
+inline std::pair<double, double> GetGradient(Context const *ctx, int group_idx, int num_group,
+                                             bst_feature_t fidx,
+                                             std::vector<GradientPair> const &gpair,
                                              DMatrix *p_fmat) {
   double sum_grad = 0.0, sum_hess = 0.0;
-  for (const auto &batch : p_fmat->GetBatches<CSCPage>()) {
+  for (const auto &batch : p_fmat->GetBatches<CSCPage>(ctx)) {
     auto page = batch.GetView();
     auto col = page[fidx];
     const auto ndata = static_cast<bst_omp_uint>(col.size());
@@ -108,14 +112,14 @@ inline std::pair<double, double> GetGradient(int group_idx, int num_group, int f
  *
  * \return  The gradient and diagonal Hessian entry for a given feature.
  */
-inline std::pair<double, double>
-GetGradientParallel(GenericParameter const *ctx, int group_idx, int num_group,
-                    int fidx, const std::vector<GradientPair> &gpair,
-                    DMatrix *p_fmat) {
+inline std::pair<double, double> GetGradientParallel(Context const *ctx, int group_idx,
+                                                     int num_group, int fidx,
+                                                     const std::vector<GradientPair> &gpair,
+                                                     DMatrix *p_fmat) {
   std::vector<double> sum_grad_tloc(ctx->Threads(), 0.0);
   std::vector<double> sum_hess_tloc(ctx->Threads(), 0.0);
 
-  for (const auto &batch : p_fmat->GetBatches<CSCPage>()) {
+  for (const auto &batch : p_fmat->GetBatches<CSCPage>(ctx)) {
     auto page = batch.GetView();
     auto col = page[fidx];
     const auto ndata = static_cast<bst_omp_uint>(col.size());
@@ -130,10 +134,8 @@ GetGradientParallel(GenericParameter const *ctx, int group_idx, int num_group,
       sum_hess_tloc[t_idx] += p.GetHess() * v * v;
     });
   }
-  double sum_grad =
-      std::accumulate(sum_grad_tloc.cbegin(), sum_grad_tloc.cend(), 0.0);
-  double sum_hess =
-      std::accumulate(sum_hess_tloc.cbegin(), sum_hess_tloc.cend(), 0.0);
+  double sum_grad = std::accumulate(sum_grad_tloc.cbegin(), sum_grad_tloc.cend(), 0.0);
+  double sum_hess = std::accumulate(sum_hess_tloc.cbegin(), sum_hess_tloc.cend(), 0.0);
   return std::make_pair(sum_grad, sum_hess);
 }
 
@@ -149,21 +151,21 @@ GetGradientParallel(GenericParameter const *ctx, int group_idx, int num_group,
  */
 inline std::pair<double, double> GetBiasGradientParallel(int group_idx, int num_group,
                                                          const std::vector<GradientPair> &gpair,
-                                                         DMatrix *p_fmat) {
-  double sum_grad = 0.0, sum_hess = 0.0;
+                                                         DMatrix *p_fmat, int32_t n_threads) {
   const auto ndata = static_cast<bst_omp_uint>(p_fmat->Info().num_row_);
-  dmlc::OMPException exc;
-#pragma omp parallel for schedule(static) reduction(+ : sum_grad, sum_hess)
-  for (bst_omp_uint i = 0; i < ndata; ++i) {
-    exc.Run([&]() {
-      auto &p = gpair[i * num_group + group_idx];
-      if (p.GetHess() >= 0.0f) {
-        sum_grad += p.GetGrad();
-        sum_hess += p.GetHess();
-      }
-    });
-  }
-  exc.Rethrow();
+  std::vector<double> sum_grad_tloc(n_threads, 0);
+  std::vector<double> sum_hess_tloc(n_threads, 0);
+
+  common::ParallelFor(ndata, n_threads, [&](auto i) {
+    auto tid = omp_get_thread_num();
+    auto &p = gpair[i * num_group + group_idx];
+    if (p.GetHess() >= 0.0f) {
+      sum_grad_tloc[tid] += p.GetGrad();
+      sum_hess_tloc[tid] += p.GetHess();
+    }
+  });
+  double sum_grad = std::accumulate(sum_grad_tloc.cbegin(), sum_grad_tloc.cend(), 0.0);
+  double sum_hess = std::accumulate(sum_hess_tloc.cbegin(), sum_hess_tloc.cend(), 0.0);
   return std::make_pair(sum_grad, sum_hess);
 }
 
@@ -177,25 +179,20 @@ inline std::pair<double, double> GetBiasGradientParallel(int group_idx, int num_
  * \param in_gpair  The gradient vector to be updated.
  * \param p_fmat    The input feature matrix.
  */
-inline void UpdateResidualParallel(int fidx, int group_idx, int num_group,
-                                   float dw, std::vector<GradientPair> *in_gpair,
+inline void UpdateResidualParallel(Context const *ctx, bst_feature_t fidx, int group_idx,
+                                   int num_group, float dw, std::vector<GradientPair> *in_gpair,
                                    DMatrix *p_fmat) {
   if (dw == 0.0f) return;
-  for (const auto &batch : p_fmat->GetBatches<CSCPage>()) {
+  for (const auto &batch : p_fmat->GetBatches<CSCPage>(ctx)) {
     auto page = batch.GetView();
     auto col = page[fidx];
     // update grad value
     const auto num_row = static_cast<bst_omp_uint>(col.size());
-    dmlc::OMPException exc;
-#pragma omp parallel for schedule(static)
-    for (bst_omp_uint j = 0; j < num_row; ++j) {
-      exc.Run([&]() {
-        GradientPair &p = (*in_gpair)[col[j].index * num_group + group_idx];
-        if (p.GetHess() < 0.0f) return;
-        p += GradientPair(p.GetHess() * col[j].fvalue * dw, 0);
-      });
-    }
-    exc.Rethrow();
+    common::ParallelFor(num_row, ctx->Threads(), [&](auto j) {
+      GradientPair &p = (*in_gpair)[col[j].index * num_group + group_idx];
+      if (p.GetHess() < 0.0f) return;
+      p += GradientPair(p.GetHess() * col[j].fvalue * dw, 0);
+    });
   }
 }
 
@@ -208,21 +205,16 @@ inline void UpdateResidualParallel(int fidx, int group_idx, int num_group,
  * \param in_gpair  The gradient vector to be updated.
  * \param p_fmat    The input feature matrix.
  */
-inline void UpdateBiasResidualParallel(int group_idx, int num_group, float dbias,
-                                       std::vector<GradientPair> *in_gpair,
+inline void UpdateBiasResidualParallel(Context const *ctx, int group_idx, int num_group,
+                                       float dbias, std::vector<GradientPair> *in_gpair,
                                        DMatrix *p_fmat) {
   if (dbias == 0.0f) return;
   const auto ndata = static_cast<bst_omp_uint>(p_fmat->Info().num_row_);
-  dmlc::OMPException exc;
-#pragma omp parallel for schedule(static)
-  for (bst_omp_uint i = 0; i < ndata; ++i) {
-    exc.Run([&]() {
-      GradientPair &g = (*in_gpair)[i * num_group + group_idx];
-      if (g.GetHess() < 0.0f) return;
-      g += GradientPair(g.GetHess() * dbias, 0);
-    });
-  }
-  exc.Rethrow();
+  common::ParallelFor(ndata, ctx->Threads(), [&](auto i) {
+    GradientPair &g = (*in_gpair)[i * num_group + group_idx];
+    if (g.GetHess() < 0.0f) return;
+    g += GradientPair(g.GetHess() * dbias, 0);
+  });
 }
 
 /**
@@ -231,6 +223,7 @@ inline void UpdateBiasResidualParallel(int group_idx, int num_group, float dbias
  */
 class FeatureSelector {
  public:
+  FeatureSelector() = default;
   /*! \brief factory method */
   static FeatureSelector *Create(int choice);
   /*! \brief virtual destructor */
@@ -238,6 +231,7 @@ class FeatureSelector {
   /**
    * \brief Setting up the selector state prior to looping through features.
    *
+   * \param ctx    The booster context.
    * \param model  The model.
    * \param gpair  The gpair.
    * \param p_fmat The feature matrix.
@@ -245,13 +239,12 @@ class FeatureSelector {
    * \param lambda Regularisation lambda.
    * \param param  A parameter with algorithm-dependent use.
    */
-  virtual void Setup(const gbm::GBLinearModel &,
-                     const std::vector<GradientPair> &,
-                     DMatrix *,
-                     float , float , int ) {}
+  virtual void Setup(Context const *, const gbm::GBLinearModel &, const std::vector<GradientPair> &,
+                     DMatrix *, float, float, int) {}
   /**
    * \brief Select next coordinate to update.
    *
+   * \param ctx       Booster context
    * \param iteration The iteration in a loop through features
    * \param model     The model.
    * \param group_idx Zero-based index of the group.
@@ -262,11 +255,9 @@ class FeatureSelector {
    *
    * \return  The index of the selected feature. -1 indicates none selected.
    */
-  virtual int NextFeature(int iteration,
-                          const gbm::GBLinearModel &model,
-                          int group_idx,
-                          const std::vector<GradientPair> &gpair,
-                          DMatrix *p_fmat, float alpha, float lambda) = 0;
+  virtual int NextFeature(Context const *ctx, int iteration, const gbm::GBLinearModel &model,
+                          int group_idx, const std::vector<GradientPair> &gpair, DMatrix *p_fmat,
+                          float alpha, float lambda) = 0;
 };
 
 /**
@@ -274,10 +265,10 @@ class FeatureSelector {
  */
 class CyclicFeatureSelector : public FeatureSelector {
  public:
-  int NextFeature(int iteration, const gbm::GBLinearModel &model,
-                  int , const std::vector<GradientPair> &,
-                  DMatrix *, float, float) override {
-    return iteration % model.learner_model_param->num_feature;
+  using FeatureSelector::FeatureSelector;
+  int NextFeature(Context const *, int iteration, const gbm::GBLinearModel &model, int,
+                  const std::vector<GradientPair> &, DMatrix *, float, float) override {
+    return iteration % model.learner_model_state->num_feature;
   }
 };
 
@@ -287,20 +278,19 @@ class CyclicFeatureSelector : public FeatureSelector {
  */
 class ShuffleFeatureSelector : public FeatureSelector {
  public:
-  void Setup(const gbm::GBLinearModel &model,
-             const std::vector<GradientPair>&,
+  using FeatureSelector::FeatureSelector;
+  void Setup(Context const *ctx, const gbm::GBLinearModel &model, const std::vector<GradientPair> &,
              DMatrix *, float, float, int) override {
     if (feat_index_.size() == 0) {
-      feat_index_.resize(model.learner_model_param->num_feature);
+      feat_index_.resize(model.learner_model_state->num_feature);
       std::iota(feat_index_.begin(), feat_index_.end(), 0);
     }
-    std::shuffle(feat_index_.begin(), feat_index_.end(), common::GlobalRandom());
+    std::shuffle(feat_index_.begin(), feat_index_.end(), ctx->Rng());
   }
 
-  int NextFeature(int iteration, const gbm::GBLinearModel &model,
-                  int, const std::vector<GradientPair> &,
-                  DMatrix *, float, float) override {
-    return feat_index_[iteration % model.learner_model_param->num_feature];
+  int NextFeature(Context const *, int iteration, const gbm::GBLinearModel &model, int,
+                  const std::vector<GradientPair> &, DMatrix *, float, float) override {
+    return feat_index_[iteration % model.learner_model_state->num_feature];
   }
 
  protected:
@@ -313,10 +303,10 @@ class ShuffleFeatureSelector : public FeatureSelector {
  */
 class RandomFeatureSelector : public FeatureSelector {
  public:
-  int NextFeature(int, const gbm::GBLinearModel &model,
-                  int, const std::vector<GradientPair> &,
-                  DMatrix *, float, float) override {
-    return common::GlobalRandom()() % model.learner_model_param->num_feature;
+  using FeatureSelector::FeatureSelector;
+  int NextFeature(Context const *ctx, int, const gbm::GBLinearModel &model, int,
+                  const std::vector<GradientPair> &, DMatrix *, float, float) override {
+    return ctx->Rng()() % model.learner_model_state->num_feature;
   }
 };
 
@@ -331,36 +321,36 @@ class RandomFeatureSelector : public FeatureSelector {
  */
 class GreedyFeatureSelector : public FeatureSelector {
  public:
-  void Setup(const gbm::GBLinearModel &model,
-             const std::vector<GradientPair> &,
+  using FeatureSelector::FeatureSelector;
+  void Setup(Context const *, const gbm::GBLinearModel &model, const std::vector<GradientPair> &,
              DMatrix *, float, float, int param) override {
     top_k_ = static_cast<bst_uint>(param);
-    const bst_uint ngroup = model.learner_model_param->num_output_group;
+    const bst_uint ngroup = model.learner_model_state->num_output_group;
     if (param <= 0) top_k_ = std::numeric_limits<bst_uint>::max();
     if (counter_.size() == 0) {
       counter_.resize(ngroup);
-      gpair_sums_.resize(model.learner_model_param->num_feature * ngroup);
+      gpair_sums_.resize(model.learner_model_state->num_feature * ngroup);
     }
     for (bst_uint gid = 0u; gid < ngroup; ++gid) {
       counter_[gid] = 0u;
     }
   }
 
-  int NextFeature(int, const gbm::GBLinearModel &model,
-                  int group_idx, const std::vector<GradientPair> &gpair,
-                  DMatrix *p_fmat, float alpha, float lambda) override {
+  int NextFeature(Context const *ctx, int, const gbm::GBLinearModel &model, int group_idx,
+                  const std::vector<GradientPair> &gpair, DMatrix *p_fmat, float alpha,
+                  float lambda) override {
     // k-th selected feature for a group
     auto k = counter_[group_idx]++;
     // stop after either reaching top-K or going through all the features in a group
-    if (k >= top_k_ || counter_[group_idx] == model.learner_model_param->num_feature) return -1;
+    if (k >= top_k_ || counter_[group_idx] == model.learner_model_state->num_feature) return -1;
 
-    const int ngroup = model.learner_model_param->num_output_group;
-    const bst_omp_uint nfeat = model.learner_model_param->num_feature;
+    const int ngroup = model.learner_model_state->num_output_group;
+    const bst_omp_uint nfeat = model.learner_model_state->num_feature;
     // Calculate univariate gradient sums
     std::fill(gpair_sums_.begin(), gpair_sums_.end(), std::make_pair(0., 0.));
-    for (const auto &batch : p_fmat->GetBatches<CSCPage>()) {
+    for (const auto &batch : p_fmat->GetBatches<CSCPage>(ctx)) {
       auto page = batch.GetView();
-      common::ParallelFor(nfeat, [&](bst_omp_uint i) {
+      common::ParallelFor(nfeat, ctx->Threads(), [&](bst_omp_uint i) {
         const auto col = page[i];
         const bst_uint ndata = col.size();
         auto &sums = gpair_sums_[group_idx * nfeat + i];
@@ -379,7 +369,7 @@ class GreedyFeatureSelector : public FeatureSelector {
     for (bst_omp_uint fidx = 0; fidx < nfeat; ++fidx) {
       auto &s = gpair_sums_[group_idx * nfeat + fidx];
       float dw = std::abs(static_cast<bst_float>(
-                 CoordinateDelta(s.first, s.second, model[fidx][group_idx], alpha, lambda)));
+          CoordinateDelta(s.first, s.second, model[fidx][group_idx], alpha, lambda)));
       if (dw > best_weight_update) {
         best_weight_update = dw;
         best_fidx = fidx;
@@ -407,13 +397,15 @@ class GreedyFeatureSelector : public FeatureSelector {
  */
 class ThriftyFeatureSelector : public FeatureSelector {
  public:
-  void Setup(const gbm::GBLinearModel &model,
-             const std::vector<GradientPair> &gpair,
-             DMatrix *p_fmat, float alpha, float lambda, int param) override {
+  using FeatureSelector::FeatureSelector;
+
+  void Setup(Context const *ctx, const gbm::GBLinearModel &model,
+             const std::vector<GradientPair> &gpair, DMatrix *p_fmat, float alpha, float lambda,
+             int param) override {
     top_k_ = static_cast<bst_uint>(param);
     if (param <= 0) top_k_ = std::numeric_limits<bst_uint>::max();
-    const bst_uint ngroup = model.learner_model_param->num_output_group;
-    const bst_omp_uint nfeat = model.learner_model_param->num_feature;
+    const bst_uint ngroup = model.learner_model_state->num_output_group;
+    const bst_omp_uint nfeat = model.learner_model_state->num_feature;
 
     if (deltaw_.size() == 0) {
       deltaw_.resize(nfeat * ngroup);
@@ -423,10 +415,10 @@ class ThriftyFeatureSelector : public FeatureSelector {
     }
     // Calculate univariate gradient sums
     std::fill(gpair_sums_.begin(), gpair_sums_.end(), std::make_pair(0., 0.));
-    for (const auto &batch : p_fmat->GetBatches<CSCPage>()) {
+    for (const auto &batch : p_fmat->GetBatches<CSCPage>(ctx)) {
       auto page = batch.GetView();
       // column-parallel is usually fastaer than row-parallel
-      common::ParallelFor(nfeat, [&](bst_omp_uint i) {
+      common::ParallelFor(nfeat, ctx->Threads(), [&](auto i) {
         const auto col = page[i];
         const bst_uint ndata = col.size();
         for (bst_uint gid = 0u; gid < ngroup; ++gid) {
@@ -450,28 +442,26 @@ class ThriftyFeatureSelector : public FeatureSelector {
       for (bst_omp_uint i = 0; i < nfeat; ++i) {
         auto ii = gid * nfeat + i;
         auto &s = gpair_sums_[ii];
-        deltaw_[ii] = static_cast<bst_float>(CoordinateDelta(
-                       s.first, s.second, model[i][gid], alpha, lambda));
+        deltaw_[ii] = static_cast<bst_float>(
+            CoordinateDelta(s.first, s.second, model[i][gid], alpha, lambda));
       }
       // sort in descending order of deltaw abs values
       auto start = sorted_idx_.begin() + gid * nfeat;
-      std::sort(start, start + nfeat,
-                [pdeltaw](size_t i, size_t j) {
-                  return std::abs(*(pdeltaw + i)) > std::abs(*(pdeltaw + j));
-                });
+      std::sort(start, start + nfeat, [pdeltaw](size_t i, size_t j) {
+        return std::abs(*(pdeltaw + i)) > std::abs(*(pdeltaw + j));
+      });
       counter_[gid] = 0u;
     }
   }
 
-  int NextFeature(int, const gbm::GBLinearModel &model,
-                  int group_idx, const std::vector<GradientPair> &,
-                  DMatrix *, float, float) override {
+  int NextFeature(Context const *, int, const gbm::GBLinearModel &model, int group_idx,
+                  const std::vector<GradientPair> &, DMatrix *, float, float) override {
     // k-th selected feature for a group
     auto k = counter_[group_idx]++;
     // stop after either reaching top-N or going through all the features in a group
-    if (k >= top_k_ || counter_[group_idx] == model.learner_model_param->num_feature) return -1;
+    if (k >= top_k_ || counter_[group_idx] == model.learner_model_state->num_feature) return -1;
     // note that sorted_idx stores the "long" indices
-    const size_t grp_offset = group_idx * model.learner_model_param->num_feature;
+    const size_t grp_offset = group_idx * model.learner_model_state->num_feature;
     return static_cast<int>(sorted_idx_[grp_offset + k] - grp_offset);
   }
 
@@ -486,15 +476,15 @@ class ThriftyFeatureSelector : public FeatureSelector {
 inline FeatureSelector *FeatureSelector::Create(int choice) {
   switch (choice) {
     case kCyclic:
-      return new CyclicFeatureSelector();
+      return new CyclicFeatureSelector;
     case kShuffle:
-      return new ShuffleFeatureSelector();
+      return new ShuffleFeatureSelector;
     case kThrifty:
-      return new ThriftyFeatureSelector();
+      return new ThriftyFeatureSelector;
     case kGreedy:
-      return new GreedyFeatureSelector();
+      return new GreedyFeatureSelector;
     case kRandom:
-      return new RandomFeatureSelector();
+      return new RandomFeatureSelector;
     default:
       LOG(FATAL) << "unknown coordinate selector: " << choice;
   }

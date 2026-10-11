@@ -1,35 +1,47 @@
-// Copyright by Contributors
-#include <dmlc/filesystem.h>
+/**
+ * Copyright 2016-2025, XGBoost Contributors
+ */
 #include <xgboost/data.h>
 
-#include <array>
+#include <array>   // std::array
+#include <limits>  // std::numeric_limits
+#include <memory>  // std::unique_ptr
+
+#include "../../../src/data/adapter.h"         // ArrayAdapter
+#include "../../../src/data/simple_dmatrix.h"  // SimpleDMatrix
+#include "../collective/test_worker.h"         // for TestDistributedGlobal
+#include "../filesystem.h"                     // for TemporaryDirectory
+#include "../helpers.h"                        // RandomDataGenerator,CreateSimpleTestData
 #include "xgboost/base.h"
-#include "../../../src/data/simple_dmatrix.h"
-#include "../../../src/data/adapter.h"
-#include "../helpers.h"
+#include "xgboost/host_device_vector.h"  // HostDeviceVector
+#include "xgboost/string_view.h"         // StringView
 
 using namespace xgboost;  // NOLINT
 
+namespace {
+std::string UriSVM(std::string name) { return name + "?format=libsvm"; }
+}  // namespace
+
 TEST(SimpleDMatrix, MetaInfo) {
-  dmlc::TemporaryDirectory tempdir;
-  const std::string tmp_file = tempdir.path + "/simple.libsvm";
+  common::TemporaryDirectory tempdir;
+  const std::string tmp_file = tempdir.Str() + "/simple.libsvm";
   CreateSimpleTestData(tmp_file);
-  xgboost::DMatrix *dmat = xgboost::DMatrix::Load(tmp_file, true, false);
+  xgboost::DMatrix *dmat = xgboost::DMatrix::Load(UriSVM(tmp_file));
 
   // Test the metadata that was parsed
   EXPECT_EQ(dmat->Info().num_row_, 2);
   EXPECT_EQ(dmat->Info().num_col_, 5);
   EXPECT_EQ(dmat->Info().num_nonzero_, 6);
-  EXPECT_EQ(dmat->Info().labels_.Size(), dmat->Info().num_row_);
+  EXPECT_EQ(dmat->Info().labels.Size(), dmat->Info().num_row_);
 
   delete dmat;
 }
 
 TEST(SimpleDMatrix, RowAccess) {
-  dmlc::TemporaryDirectory tempdir;
-  const std::string tmp_file = tempdir.path + "/simple.libsvm";
+  common::TemporaryDirectory tempdir;
+  const std::string tmp_file = tempdir.Str() + "/simple.libsvm";
   CreateSimpleTestData(tmp_file);
-  xgboost::DMatrix *dmat = xgboost::DMatrix::Load(tmp_file, false, false);
+  xgboost::DMatrix *dmat = xgboost::DMatrix::Load(UriSVM(tmp_file), false);
 
   // Loop over the batches and count the records
   int64_t row_count = 0;
@@ -49,16 +61,17 @@ TEST(SimpleDMatrix, RowAccess) {
 }
 
 TEST(SimpleDMatrix, ColAccessWithoutBatches) {
-  dmlc::TemporaryDirectory tempdir;
-  const std::string tmp_file = tempdir.path + "/simple.libsvm";
+  Context ctx;
+  common::TemporaryDirectory tempdir;
+  const std::string tmp_file = tempdir.Str() + "/simple.libsvm";
   CreateSimpleTestData(tmp_file);
-  xgboost::DMatrix *dmat = xgboost::DMatrix::Load(tmp_file, true, false);
+  xgboost::DMatrix *dmat = xgboost::DMatrix::Load(UriSVM(tmp_file));
 
   ASSERT_TRUE(dmat->SingleColBlock());
 
   // Loop over the batches and assert the data is as expected
   int64_t num_col_batch = 0;
-  for (const auto &batch : dmat->GetBatches<xgboost::SortedCSCPage>()) {
+  for (const auto &batch : dmat->GetBatches<xgboost::SortedCSCPage>(&ctx)) {
     num_col_batch += 1;
     EXPECT_EQ(batch.Size(), dmat->Info().num_col_)
         << "Expected batch size = number of cells as #batches is 1.";
@@ -68,14 +81,17 @@ TEST(SimpleDMatrix, ColAccessWithoutBatches) {
 }
 
 TEST(SimpleDMatrix, Empty) {
-  std::vector<float> data{};
-  std::vector<unsigned> feature_idx = {};
-  std::vector<size_t> row_ptr = {};
+  HostDeviceVector<float> data{};
+  HostDeviceVector<unsigned> feature_idx{};
+  HostDeviceVector<size_t> row_ptr{};
 
-  data::CSRAdapter csr_adapter(row_ptr.data(), feature_idx.data(), data.data(),
-                               0, 0, 0);
-  std::unique_ptr<data::SimpleDMatrix> dmat(new data::SimpleDMatrix(
-      &csr_adapter, std::numeric_limits<float>::quiet_NaN(), 1));
+  auto j_data = Json::Dump(GetArrayInterface(&data, 0, 1));
+  auto j_feature_idx = Json::Dump(GetArrayInterface(&feature_idx, 0, 1));
+  auto j_row_ptr = Json::Dump(GetArrayInterface(&row_ptr, 0, 1));
+
+  data::CSRArrayAdapter csr_adapter(j_row_ptr, j_feature_idx, j_data, 0);
+  std::unique_ptr<data::SimpleDMatrix> dmat(
+      new data::SimpleDMatrix(&csr_adapter, std::numeric_limits<float>::quiet_NaN(), 1));
   CHECK_EQ(dmat->Info().num_nonzero_, 0);
   CHECK_EQ(dmat->Info().num_row_, 0);
   CHECK_EQ(dmat->Info().num_col_, 0);
@@ -84,8 +100,7 @@ TEST(SimpleDMatrix, Empty) {
   }
 
   data::DenseAdapter dense_adapter(nullptr, 0, 0);
-  dmat.reset( new data::SimpleDMatrix(&dense_adapter,
-                                      std::numeric_limits<float>::quiet_NaN(), 1) );
+  dmat.reset(new data::SimpleDMatrix(&dense_adapter, std::numeric_limits<float>::quiet_NaN(), 1));
   CHECK_EQ(dmat->Info().num_nonzero_, 0);
   CHECK_EQ(dmat->Info().num_row_, 0);
   CHECK_EQ(dmat->Info().num_col_, 0);
@@ -93,9 +108,8 @@ TEST(SimpleDMatrix, Empty) {
     CHECK_EQ(batch.Size(), 0);
   }
 
-  data::CSCAdapter csc_adapter(nullptr, nullptr, nullptr, 0, 0);
-  dmat.reset(new data::SimpleDMatrix(
-      &csc_adapter, std::numeric_limits<float>::quiet_NaN(), 1));
+  data::CSCArrayAdapter csc_adapter(j_row_ptr, j_feature_idx, j_data, 0);
+  dmat.reset(new data::SimpleDMatrix(&csc_adapter, std::numeric_limits<float>::quiet_NaN(), 1));
   CHECK_EQ(dmat->Info().num_nonzero_, 0);
   CHECK_EQ(dmat->Info().num_row_, 0);
   CHECK_EQ(dmat->Info().num_col_, 0);
@@ -105,36 +119,40 @@ TEST(SimpleDMatrix, Empty) {
 }
 
 TEST(SimpleDMatrix, MissingData) {
-  std::vector<float> data{0.0, std::nanf(""), 1.0};
-  std::vector<unsigned> feature_idx = {0, 1, 0};
-  std::vector<size_t> row_ptr = {0, 2, 3};
+  HostDeviceVector<float> data{0.0, std::nanf(""), 1.0};
+  HostDeviceVector<unsigned> feature_idx = {0, 1, 0};
+  HostDeviceVector<size_t> row_ptr = {0, 2, 3};
 
-  data::CSRAdapter adapter(row_ptr.data(), feature_idx.data(), data.data(), 2,
-                           3, 2);
-  std::unique_ptr<data::SimpleDMatrix> dmat{new data::SimpleDMatrix{
-      &adapter, std::numeric_limits<float>::quiet_NaN(), 1}};
+  auto j_data = Json::Dump(GetArrayInterface(&data, 3, 1));
+  auto j_feature_idx = Json::Dump(GetArrayInterface(&feature_idx, 3, 1));
+  auto j_row_ptr = Json::Dump(GetArrayInterface(&row_ptr, 3, 1));
+
+  data::CSRArrayAdapter adapter{j_row_ptr, j_feature_idx, j_data, 2ul};
+  std::unique_ptr<data::SimpleDMatrix> dmat{
+      new data::SimpleDMatrix{&adapter, std::numeric_limits<float>::quiet_NaN(), 1}};
   CHECK_EQ(dmat->Info().num_nonzero_, 2);
   dmat.reset(new data::SimpleDMatrix(&adapter, 1.0, 1));
   CHECK_EQ(dmat->Info().num_nonzero_, 1);
 
   {
-    data[1] = std::numeric_limits<float>::infinity();
-    data::DenseAdapter adapter(data.data(), data.size(), 1);
-    EXPECT_THROW(data::SimpleDMatrix dmat(
-                     &adapter, std::numeric_limits<float>::quiet_NaN(), -1),
+    data.HostVector()[1] = std::numeric_limits<float>::infinity();
+    data::DenseAdapter adapter(data.ConstHostPointer(), data.Size(), 1);
+    EXPECT_THROW(data::SimpleDMatrix dmat(&adapter, std::numeric_limits<float>::quiet_NaN(), -1),
                  dmlc::Error);
   }
 }
 
 TEST(SimpleDMatrix, EmptyRow) {
-  std::vector<float> data{0.0, 1.0};
-  std::vector<unsigned> feature_idx = {0, 1};
-  std::vector<size_t> row_ptr = {0, 2, 2};
+  HostDeviceVector<float> data{0.0, 1.0};
+  HostDeviceVector<unsigned> feature_idx{0, 1};
+  HostDeviceVector<size_t> row_ptr{0, 2, 2};
 
-  data::CSRAdapter adapter(row_ptr.data(), feature_idx.data(), data.data(), 2,
-                           2, 2);
-  data::SimpleDMatrix dmat(&adapter, std::numeric_limits<float>::quiet_NaN(),
-                           1);
+  auto j_data = Json::Dump(GetArrayInterface(&data, 2, 1));
+  auto j_feature_idx = Json::Dump(GetArrayInterface(&feature_idx, 2, 1));
+  auto j_row_ptr = Json::Dump(GetArrayInterface(&row_ptr, 3, 1));
+
+  data::CSRArrayAdapter adapter{j_row_ptr, j_feature_idx, j_data, 2};
+  data::SimpleDMatrix dmat(&adapter, std::numeric_limits<float>::quiet_NaN(), 1);
   CHECK_EQ(dmat.Info().num_nonzero_, 2);
   CHECK_EQ(dmat.Info().num_row_, 2);
   CHECK_EQ(dmat.Info().num_col_, 2);
@@ -145,8 +163,7 @@ TEST(SimpleDMatrix, FromDense) {
   int n = 2;
   std::vector<float> data = {1, 2, 3, 4, 5, 6};
   data::DenseAdapter adapter(data.data(), m, n);
-  data::SimpleDMatrix dmat(&adapter, std::numeric_limits<float>::quiet_NaN(),
-                           -1);
+  data::SimpleDMatrix dmat(&adapter, std::numeric_limits<float>::quiet_NaN(), -1);
   EXPECT_EQ(dmat.Info().num_col_, 2);
   EXPECT_EQ(dmat.Info().num_row_, 3);
   EXPECT_EQ(dmat.Info().num_nonzero_, 6);
@@ -164,12 +181,16 @@ TEST(SimpleDMatrix, FromDense) {
 }
 
 TEST(SimpleDMatrix, FromCSC) {
-  std::vector<float> data = {1, 3, 2, 4, 5};
-  std::vector<unsigned> row_idx = {0, 1, 0, 1, 2};
-  std::vector<size_t> col_ptr = {0, 2, 5};
-  data::CSCAdapter adapter(col_ptr.data(), row_idx.data(), data.data(), 2, 3);
-  data::SimpleDMatrix dmat(&adapter, std::numeric_limits<float>::quiet_NaN(),
-                           -1);
+  HostDeviceVector<float> data{1, 3, 2, 4, 5};
+  HostDeviceVector<unsigned> row_idx{0, 1, 0, 1, 2};
+  HostDeviceVector<size_t> col_ptr{0, 2, 5};
+
+  auto j_data = Json::Dump(GetArrayInterface(&data, data.Size(), 1));
+  auto j_row_idx = Json::Dump(GetArrayInterface(&row_idx, row_idx.Size(), 1));
+  auto j_col_ptr = Json::Dump(GetArrayInterface(&col_ptr, col_ptr.Size(), 1));
+
+  data::CSCArrayAdapter adapter{j_col_ptr, j_row_idx, j_data, 3};
+  data::SimpleDMatrix dmat(&adapter, std::numeric_limits<float>::quiet_NaN(), -1);
   EXPECT_EQ(dmat.Info().num_col_, 2);
   EXPECT_EQ(dmat.Info().num_row_, 3);
   EXPECT_EQ(dmat.Info().num_nonzero_, 5);
@@ -194,7 +215,8 @@ TEST(SimpleDMatrix, FromCSC) {
 }
 
 TEST(SimpleDMatrix, FromFile) {
-  std::string filename = "test.libsvm";
+  common::TemporaryDirectory tempdir;
+  std::string filename = tempdir.Str() + "/test.libsvm";
   CreateBigTestData(filename, 3 * 5);
   // Add an empty row at the end of the matrix
   {
@@ -208,8 +230,7 @@ TEST(SimpleDMatrix, FromFile) {
   auto verify_batch = [kExpectedNumRow](SparsePage const &page) {
     auto batch = page.GetView();
     EXPECT_EQ(batch.Size(), kExpectedNumRow);
-    EXPECT_EQ(page.offset.HostVector(),
-              std::vector<bst_row_t>({0, 3, 6, 9, 12, 15, 15}));
+    EXPECT_EQ(page.offset.HostVector(), std::vector<bst_idx_t>({0, 3, 6, 9, 12, 15, 15}));
     EXPECT_EQ(page.base_rowid, 0);
 
     for (auto i = 0ull; i < batch.Size() - 1; i++) {
@@ -227,8 +248,7 @@ TEST(SimpleDMatrix, FromFile) {
 
   constexpr bst_feature_t kCols = 5;
   data::FileAdapter adapter(parser.get());
-  data::SimpleDMatrix dmat(&adapter, std::numeric_limits<float>::quiet_NaN(),
-                           1);
+  data::SimpleDMatrix dmat(&adapter, std::numeric_limits<float>::quiet_NaN(), 1);
   ASSERT_EQ(dmat.Info().num_col_, kCols);
 
   for (auto &batch : dmat.GetBatches<SparsePage>()) {
@@ -237,33 +257,33 @@ TEST(SimpleDMatrix, FromFile) {
 }
 
 TEST(SimpleDMatrix, Slice) {
-  size_t constexpr kRows {16};
-  size_t constexpr kCols {8};
-  size_t constexpr kClasses {3};
+  size_t constexpr kRows{16};
+  size_t constexpr kCols{8};
+  size_t constexpr kClasses{3};
   auto p_m = RandomDataGenerator{kRows, kCols, 0}.GenerateDMatrix(true);
-  auto& weights = p_m->Info().weights_.HostVector();
+  auto &weights = p_m->Info().weights_.HostVector();
   weights.resize(kRows);
   std::iota(weights.begin(), weights.end(), 0.0f);
 
-  auto& lower = p_m->Info().labels_lower_bound_.HostVector();
-  auto& upper = p_m->Info().labels_upper_bound_.HostVector();
+  auto &lower = p_m->Info().labels_lower_bound_.HostVector();
+  auto &upper = p_m->Info().labels_upper_bound_.HostVector();
   lower.resize(kRows);
   upper.resize(kRows);
 
   std::iota(lower.begin(), lower.end(), 0.0f);
   std::iota(upper.begin(), upper.end(), 1.0f);
 
-  auto& margin = p_m->Info().base_margin_;
-  margin = linalg::Tensor<float, 3>{{kRows, kClasses}, GenericParameter::kCpuId};
+  auto &margin = p_m->Info().base_margin_;
+  margin = decltype(p_m->Info().base_margin_){{kRows, kClasses}, DeviceOrd::CPU()};
 
-  std::array<int32_t, 3> ridxs {1, 3, 5};
-  std::unique_ptr<DMatrix> out { p_m->Slice(ridxs) };
-  ASSERT_EQ(out->Info().labels_.Size(), ridxs.size());
+  std::array<int32_t, 3> ridxs{1, 3, 5};
+  std::unique_ptr<DMatrix> out{p_m->Slice(ridxs)};
+  ASSERT_EQ(out->Info().labels.Size(), ridxs.size());
   ASSERT_EQ(out->Info().labels_lower_bound_.Size(), ridxs.size());
   ASSERT_EQ(out->Info().labels_upper_bound_.Size(), ridxs.size());
   ASSERT_EQ(out->Info().base_margin_.Size(), ridxs.size() * kClasses);
 
-  for (auto const& in_batch : p_m->GetBatches<SparsePage>()) {
+  for (auto const &in_batch : p_m->GetBatches<SparsePage>()) {
     auto in_page = in_batch.GetView();
     for (auto const &out_batch : out->GetBatches<SparsePage>()) {
       auto out_page = out_batch.GetView();
@@ -284,8 +304,8 @@ TEST(SimpleDMatrix, Slice) {
         ASSERT_EQ(p_m->Info().weights_.HostVector().at(ridx),
                   out->Info().weights_.HostVector().at(i));
 
-        auto out_margin = out->Info().base_margin_.View(GenericParameter::kCpuId);
-        auto in_margin = margin.View(GenericParameter::kCpuId);
+        auto out_margin = out->Info().base_margin_.View(DeviceOrd::CPU());
+        auto in_margin = margin.View(DeviceOrd::CPU());
         for (size_t j = 0; j < kClasses; ++j) {
           ASSERT_EQ(out_margin(i, j), in_margin(ridx, j));
         }
@@ -296,18 +316,29 @@ TEST(SimpleDMatrix, Slice) {
   ASSERT_EQ(out->Info().num_col_, out->Info().num_col_);
   ASSERT_EQ(out->Info().num_row_, ridxs.size());
   ASSERT_EQ(out->Info().num_nonzero_, ridxs.size() * kCols);  // dense
+
+  {
+    HostDeviceVector<float> data;
+    auto arr_str = RandomDataGenerator{kRows, kCols, 0.0}.GenerateArrayInterface(&data);
+    auto adapter = data::ArrayAdapter{StringView{arr_str}};
+    auto n_threads = 2;
+    std::unique_ptr<DMatrix> p_fmat{
+        DMatrix::Create(&adapter, std::numeric_limits<float>::quiet_NaN(), n_threads, "")};
+    std::unique_ptr<DMatrix> slice{p_fmat->Slice(ridxs)};
+    ASSERT_LE(slice->Ctx()->Threads(), n_threads);
+  }
 }
 
 TEST(SimpleDMatrix, SaveLoadBinary) {
-  dmlc::TemporaryDirectory tempdir;
-  const std::string tmp_file = tempdir.path + "/simple.libsvm";
+  common::TemporaryDirectory tempdir;
+  const std::string tmp_file = tempdir.Str() + "/simple.libsvm";
   CreateSimpleTestData(tmp_file);
-  xgboost::DMatrix * dmat = xgboost::DMatrix::Load(tmp_file, true, false);
-  data::SimpleDMatrix *simple_dmat = dynamic_cast<data::SimpleDMatrix*>(dmat);
+  xgboost::DMatrix *dmat = xgboost::DMatrix::Load(UriSVM(tmp_file));
+  data::SimpleDMatrix *simple_dmat = dynamic_cast<data::SimpleDMatrix *>(dmat);
 
-  const std::string tmp_binfile = tempdir.path + "/csr_source.binary";
+  const std::string tmp_binfile = tempdir.Str() + "/csr_source.binary";
   simple_dmat->SaveToLocalFile(tmp_binfile);
-  xgboost::DMatrix * dmat_read = xgboost::DMatrix::Load(tmp_binfile, true, false);
+  xgboost::DMatrix *dmat_read = xgboost::DMatrix::Load(tmp_binfile);
 
   EXPECT_EQ(dmat->Info().num_col_, dmat_read->Info().num_col_);
   EXPECT_EQ(dmat->Info().num_row_, dmat_read->Info().num_row_);
@@ -326,4 +357,15 @@ TEST(SimpleDMatrix, SaveLoadBinary) {
   EXPECT_EQ(first_row[2].fvalue, first_row_read[2].fvalue);
   delete dmat;
   delete dmat_read;
+}
+
+TEST(SimpleDMatrix, Threads) {
+  size_t constexpr kRows{16};
+  size_t constexpr kCols{8};
+  HostDeviceVector<float> data;
+  auto arr_str = RandomDataGenerator{kRows, kCols, 0.0}.GenerateArrayInterface(&data);
+  auto adapter = data::ArrayAdapter{StringView{arr_str}};
+  std::unique_ptr<DMatrix> p_fmat{
+      DMatrix::Create(&adapter, std::numeric_limits<float>::quiet_NaN(), 0, "")};
+  ASSERT_EQ(p_fmat->Ctx()->Threads(), AllThreadsForTest());
 }

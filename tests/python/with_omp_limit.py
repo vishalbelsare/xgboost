@@ -1,8 +1,9 @@
-import os
-import xgboost as xgb
+import sys
+
 from sklearn.datasets import make_classification
 from sklearn.metrics import roc_auc_score
-import sys
+
+import xgboost as xgb
 
 
 def run_omp(output_path: str):

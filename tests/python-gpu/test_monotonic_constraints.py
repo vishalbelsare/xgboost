@@ -1,63 +1,36 @@
-import sys
-import numpy as np
-
 import pytest
 
-import xgboost as xgb
-sys.path.append("tests/python")
-import testing as tm
-import test_monotone_constraints as tmc
-
-rng = np.random.RandomState(1994)
-
-
-def non_decreasing(L):
-    return all((x - y) < 0.001 for x, y in zip(L, L[1:]))
+from xgboost.testing.monotone_constraints import (
+    run_monotone_constraints,
+    run_multi_output_monotone,
+    run_parent_gain,
+)
 
 
-def non_increasing(L):
-    return all((y - x) < 0.001 for x, y in zip(L, L[1:]))
+@pytest.mark.parametrize(
+    "tree_method,policy",
+    [
+        ("hist", "depthwise"),
+        ("approx", "depthwise"),
+        ("hist", "lossguide"),
+        ("approx", "lossguide"),
+    ],
+)
+def test_gpu_monotone_constraints(tree_method: str, policy: str) -> None:
+    run_monotone_constraints("cuda", tree_method, policy)
 
 
-def assert_constraint(constraint, tree_method):
-    from sklearn.datasets import make_regression
-    n = 1000
-    X, y = make_regression(n, random_state=rng, n_features=1, n_informative=1)
-    dtrain = xgb.DMatrix(X, y)
-    param = {}
-    param['tree_method'] = tree_method
-    param['monotone_constraints'] = "(" + str(constraint) + ")"
-    bst = xgb.train(param, dtrain)
-    dpredict = xgb.DMatrix(X[X[:, 0].argsort()])
-    pred = bst.predict(dpredict)
-
-    if constraint > 0:
-        assert non_decreasing(pred)
-    elif constraint < 0:
-        assert non_increasing(pred)
+@pytest.mark.parametrize("multi_strategy", ["one_output_per_tree", "multi_output_tree"])
+def test_parent_gain(multi_strategy: str) -> None:
+    run_parent_gain("cuda", multi_strategy)
 
 
-@pytest.mark.skipif(**tm.no_sklearn())
-def test_gpu_hist_basic():
-    assert_constraint(1, 'gpu_hist')
-    assert_constraint(-1, 'gpu_hist')
+@pytest.mark.parametrize("policy", ["depthwise", "lossguide"])
+def test_vector_leaf_monotone(policy: str) -> None:
+    run_monotone_constraints("cuda", "hist", policy, multi_strategy="multi_output_tree")
 
 
-def test_gpu_hist_depthwise():
-    params = {
-        'tree_method': 'gpu_hist',
-        'grow_policy': 'depthwise',
-        'monotone_constraints': '(1, -1)'
-    }
-    model = xgb.train(params, tmc.training_dset)
-    tmc.is_correctly_constrained(model)
-
-
-def test_gpu_hist_lossguide():
-    params = {
-        'tree_method': 'gpu_hist',
-        'grow_policy': 'lossguide',
-        'monotone_constraints': '(1, -1)'
-    }
-    model = xgb.train(params, tmc.training_dset)
-    tmc.is_correctly_constrained(model)
+@pytest.mark.parametrize("multi_strategy", ["one_output_per_tree", "multi_output_tree"])
+@pytest.mark.parametrize("policy", ["depthwise", "lossguide"])
+def test_deep_monotone(policy: str, multi_strategy: str) -> None:
+    run_multi_output_monotone("cuda", policy, multi_strategy)

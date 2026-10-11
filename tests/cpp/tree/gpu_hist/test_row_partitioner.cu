@@ -1,80 +1,44 @@
-/*!
- * Copyright 2019-2021 by XGBoost Contributors
+/**
+ * Copyright 2019-2026, XGBoost Contributors
  */
 #include <gtest/gtest.h>
-#include <vector>
-
 #include <thrust/device_vector.h>
-#include <thrust/host_vector.h>
-#include <thrust/sequence.h>
+#include <thrust/sort.h>  // for sort
+#include <thrust/transform.h>
+#include <thrust/unique.h>  // for unique
+#include <xgboost/base.h>
+#include <xgboost/tree_model.h>  // for RegTree
 
+#include <cstddef>   // for size_t
+#include <cstdint>   // for uint32_t
+#include <iterator>  // for distance
+#include <vector>    // for vector
+
+#include "../../../../src/data/ellpack_page.cuh"
+#include "../../../../src/tree/gpu_hist/expand_entry.cuh"  // for GPUExpandEntry
 #include "../../../../src/tree/gpu_hist/row_partitioner.cuh"
-#include "../../helpers.h"
+#include "../../../../src/tree/param.h"  // for TrainParam
+#include "../../../../src/tree/sample_position.h"
+#include "../../collective/test_worker.h"  // for TestDistributedGlobal
+#include "../../helpers.h"                 // for RandomDataGenerator
 
-namespace xgboost {
-namespace tree {
-
-void TestSortPosition(const std::vector<int>& position_in, int left_idx,
-                      int right_idx) {
-  dh::safe_cuda(cudaSetDevice(0));
-  std::vector<int64_t> left_count = {
-      std::count(position_in.begin(), position_in.end(), left_idx)};
-  dh::caching_device_vector<int64_t> d_left_count = left_count;
-  dh::caching_device_vector<int> position = position_in;
-  dh::caching_device_vector<int> position_out(position.size());
-
-  dh::caching_device_vector<RowPartitioner::RowIndexT> ridx(position.size());
-  thrust::sequence(ridx.begin(), ridx.end());
-  dh::caching_device_vector<RowPartitioner::RowIndexT> ridx_out(ridx.size());
-  RowPartitioner rp(0,10);
-  rp.SortPosition(
-      common::Span<int>(position.data().get(), position.size()),
-      common::Span<int>(position_out.data().get(), position_out.size()),
-      common::Span<RowPartitioner::RowIndexT>(ridx.data().get(), ridx.size()),
-      common::Span<RowPartitioner::RowIndexT>(ridx_out.data().get(), ridx_out.size()), left_idx,
-      right_idx, d_left_count.data().get(), nullptr);
-  thrust::host_vector<int> position_result = position_out;
-  thrust::host_vector<int> ridx_result = ridx_out;
-
-  // Check position is sorted
-  EXPECT_TRUE(std::is_sorted(position_result.begin(), position_result.end()));
-  // Check row indices are sorted inside left and right segment
-  EXPECT_TRUE(
-      std::is_sorted(ridx_result.begin(), ridx_result.begin() + left_count[0]));
-  EXPECT_TRUE(
-      std::is_sorted(ridx_result.begin() + left_count[0], ridx_result.end()));
-
-  // Check key value pairs are the same
-  for (auto i = 0ull; i < ridx_result.size(); i++) {
-    EXPECT_EQ(position_result[i], position_in[ridx_result[i]]);
-  }
-}
-TEST(GpuHist, SortPosition) {
-  TestSortPosition({1, 2, 1, 2, 1}, 1, 2);
-  TestSortPosition({1, 1, 1, 1}, 1, 2);
-  TestSortPosition({2, 2, 2, 2}, 1, 2);
-  TestSortPosition({1, 2, 1, 2, 3}, 1, 2);
-}
-
-void TestUpdatePosition() {
+namespace xgboost::tree {
+void TestUpdatePositionBatch() {
   const int kNumRows = 10;
-  RowPartitioner rp(0, kNumRows);
+  auto ctx = MakeCUDACtx(0);
+  RowPartitioner rp;
+  rp.Reset(&ctx, kNumRows, 0);
   auto rows = rp.GetRowsHost(0);
   EXPECT_EQ(rows.size(), kNumRows);
   for (auto i = 0ull; i < kNumRows; i++) {
     EXPECT_EQ(rows[i], i);
   }
+  std::vector<int> extra_data = {0};
+  dh::DeviceUVector<cuda_impl::RowIndexT> ridx_tmp(kNumRows);
   // Send the first five training instances to the right node
   // and the second 5 to the left node
-  rp.UpdatePosition(0, 1, 2,
-    [=] __device__(RowPartitioner::RowIndexT ridx) {
-    if (ridx > 4) {
-      return 1;
-    }
-    else {
-      return 2;
-    }
-  });
+  rp.UpdatePositionBatch(&ctx, {0}, {1}, {2}, extra_data, dh::ToSpan(ridx_tmp),
+                         [=] __device__(RowPartitioner::RowIndexT ridx, int) { return ridx > 4; });
   rows = rp.GetRowsHost(1);
   for (auto r : rows) {
     EXPECT_GT(r, 4);
@@ -85,47 +49,185 @@ void TestUpdatePosition() {
   }
 
   // Split the left node again
-  rp.UpdatePosition(1, 3, 4, [=]__device__(RowPartitioner::RowIndexT ridx)
-  {
-    if (ridx < 7) {
-      return 3
-        ;
-    }
-    return 4;
-  });
+  rp.UpdatePositionBatch(&ctx, {1}, {3}, {4}, extra_data, dh::ToSpan(ridx_tmp),
+                         [=] __device__(RowPartitioner::RowIndexT ridx, int) { return ridx < 7; });
   EXPECT_EQ(rp.GetRows(3).size(), 2);
   EXPECT_EQ(rp.GetRows(4).size(), 3);
-  // Check position is as expected
-  EXPECT_EQ(rp.GetPositionHost(), std::vector<bst_node_t>({3,3,4,4,4,2,2,2,2,2}));
 }
 
-TEST(RowPartitioner, Basic) { TestUpdatePosition(); }
+TEST(RowPartitioner, Batch) { TestUpdatePositionBatch(); }
 
-void TestFinalise() {
-  const int kNumRows = 10;
-  RowPartitioner rp(0, kNumRows);
-  rp.FinalisePosition([=]__device__(RowPartitioner::RowIndexT ridx, int position)
-  {
-    return 7;
-  });
-  auto position = rp.GetPositionHost();
-  for(auto p:position)
-  {
-    EXPECT_EQ(p, 7);
+void TestSortPositionBatch(const std::vector<int>& ridx_in, const std::vector<Segment>& segments) {
+  auto ctx = MakeCUDACtx(0);
+  thrust::device_vector<cuda_impl::RowIndexT> ridx = ridx_in;
+  thrust::device_vector<cuda_impl::RowIndexT> ridx_tmp(ridx_in.size());
+  thrust::device_vector<cuda_impl::RowIndexT> counts(segments.size());
+
+  auto op = [=] __device__(auto ridx, int data) {
+    return ridx % 2 == 0;
+  };  // NOLINT
+  std::vector<int> op_data(segments.size());
+  std::vector<PerNodeData<int>> h_batch_info(segments.size());
+  dh::TemporaryArray<PerNodeData<int>> d_batch_info(segments.size());
+
+  std::size_t total_rows = 0;
+  for (size_t i = 0; i < segments.size(); i++) {
+    h_batch_info[i] = {segments.at(i), 0};
+    total_rows += segments.at(i).Size();
+  }
+  dh::safe_cuda(cudaMemcpyAsync(d_batch_info.data().get(), h_batch_info.data(),
+                                h_batch_info.size() * sizeof(PerNodeData<int>), cudaMemcpyDefault,
+                                nullptr));
+  dh::DeviceUVector<std::int8_t> tmp;
+  SortPositionBatch<decltype(op), int>(&ctx, dh::ToSpan(d_batch_info), dh::ToSpan(ridx),
+                                       dh::ToSpan(ridx_tmp), dh::ToSpan(counts), total_rows, op,
+                                       &tmp);
+
+  auto op_without_data = [=] __device__(auto ridx) {
+    return ridx % 2 == 0;
+  };  // NOLINT
+  for (size_t i = 0; i < segments.size(); i++) {
+    auto begin = ridx.begin() + segments[i].begin;
+    auto end = ridx.begin() + segments[i].end;
+    bst_uint count = counts[i];
+    auto left_partition_count =
+        thrust::count_if(thrust::device, begin, begin + count, op_without_data);
+    EXPECT_EQ(left_partition_count, count);
+    auto right_partition_count =
+        thrust::count_if(thrust::device, begin + count, end, op_without_data);
+    EXPECT_EQ(right_partition_count, 0);
   }
 }
-TEST(RowPartitioner, Finalise) { TestFinalise(); }
 
-void TestIncorrectRow() {
-  RowPartitioner rp(0, 1);
-  rp.UpdatePosition(0, 1, 2, [=]__device__ (RowPartitioner::RowIndexT ridx)
-  {
-    return 4; // This is not the left branch or the right branch
+TEST(RowPartitioner, SortPositionBatch) {
+  TestSortPositionBatch({0, 1, 2, 3, 4, 5}, {{0, 3}, {3, 6}});
+  TestSortPositionBatch({0, 1, 2, 3, 4, 5}, {{0, 1}, {3, 6}});
+  TestSortPositionBatch({0, 1, 2, 3, 4, 5}, {{0, 6}});
+  TestSortPositionBatch({0, 1, 2, 3, 4, 5}, {{3, 6}, {0, 2}});
+}
+
+namespace {
+void GetSplit(RegTree* tree, float split_value, std::vector<GPUExpandEntry>* candidates) {
+  CHECK(!tree->IsMultiTarget());
+  tree->Expand(
+      {{RegTree::kRoot, 0, split_value, true}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, 0.0f});
+  candidates->front().nidx = 0;
+  candidates->front().depth = 0;
+  candidates->front().split.fvalue = split_value;
+  candidates->front().split.findex = 0;
+}
+
+namespace {
+template <typename Accessor>
+struct LessThanOp {
+  Accessor acc;
+  explicit LessThanOp(Accessor acc) : acc{acc} {}
+  __device__ bool operator()(bst_idx_t ridx, RegTree::Node const& node) const {
+    auto fvalue = acc.GetFvalue(ridx, node.SplitIndex());
+    return fvalue <= node.SplitCond();
+  }
+};
+}  // namespace
+
+void TestExternalMemory() {
+  auto ctx = MakeCUDACtx(0);
+
+  bst_bin_t max_bin = 32;
+  auto p_fmat =
+      RandomDataGenerator{256, 16, 0.0f}.Batches(4).GenerateSparsePageDMatrix("temp", true);
+
+  std::vector<std::unique_ptr<RowPartitioner>> partitioners;
+  RegTree tree;
+  std::vector<GPUExpandEntry> candidates(1);
+
+  auto param = BatchParam{max_bin, TrainParam::DftSparseThreshold()};
+  float split_value{0.0f};
+  bst_feature_t const split_ind = 0;
+  dh::device_vector<bst_node_t> position(p_fmat->Info().num_row_, 0);
+
+  auto n_rows = p_fmat->Info().num_row_;
+  auto encode_op = [=] __device__(bst_idx_t ridx, bst_node_t nidx) {
+    return SamplePosition::Encode(nidx, ridx < n_rows / 2);
+  };  // NOLINT
+
+  for (auto const& page : p_fmat->GetBatches<EllpackPage>(&ctx, param)) {
+    if (partitioners.empty()) {
+      auto ptr = page.Impl()->Cuts().Ptrs()[split_ind + 1];
+      split_value = page.Impl()->Cuts().Values().at(ptr / 2);
+      GetSplit(&tree, split_value, &candidates);
+    }
+
+    partitioners.emplace_back(std::make_unique<RowPartitioner>());
+    partitioners.back()->Reset(&ctx, page.Size(), page.BaseRowId());
+    dh::DeviceUVector<cuda_impl::RowIndexT> ridx_tmp(page.Size());
+    std::vector<RegTree::Node> splits{tree[0]};
+    page.Impl()->Visit(&ctx, {}, [&](auto&& acc) {
+      partitioners.back()->UpdatePositionBatch(&ctx, {0}, {1}, {2}, splits, dh::ToSpan(ridx_tmp),
+                                               LessThanOp{acc});
+    });
+    partitioners.back()->FinalisePosition(
+        &ctx, dh::ToSpan(position).subspan(page.BaseRowId(), page.Size()), page.BaseRowId(),
+        encode_op);
+  }
+
+  bst_idx_t n_left{0};
+  for (auto const& page : p_fmat->GetBatches<SparsePage>()) {
+    auto batch = page.GetView();
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      if (batch[i][split_ind].fvalue < split_value) {
+        n_left++;
+      }
+    }
+  }
+
+  RegTree::Node node = tree[RegTree::kRoot];
+  auto n_left_pos = thrust::count_if(
+      position.cbegin(), position.cend(),
+      [=] XGBOOST_DEVICE(bst_node_t v) { return SamplePosition::Decode(v) == node.LeftChild(); });
+  ASSERT_EQ(n_left, n_left_pos);
+
+  std::vector<bst_node_t> h_position(position.size());
+  dh::CopyDeviceSpanToVector(&h_position, dh::ToSpan(position));
+  for (bst_idx_t ridx = 0; ridx < n_rows; ++ridx) {
+    EXPECT_EQ(SamplePosition::IsValid(h_position[ridx]), ridx < n_rows / 2);
+  }
+
+  thrust::transform(thrust::device, position.cbegin(), position.cend(), position.begin(),
+                    [] XGBOOST_DEVICE(bst_node_t nidx) { return SamplePosition::Decode(nidx); });
+  thrust::sort(position.begin(), position.end());
+  auto end_it = thrust::unique(position.begin(), position.end());
+  ASSERT_EQ(std::distance(position.begin(), end_it), 2);
+}
+}  // anonymous namespace
+
+TEST(RowPartitioner, LeafPartitionExternalMemory) { TestExternalMemory(); }
+
+namespace {
+void TestEmptyNode(std::int32_t n_workers) {
+  collective::TestDistributedGlobal(n_workers, [] {
+    auto ctx = MakeCUDACtx(DistGpuIdx());
+    RowPartitioner partitioner;
+    bst_idx_t n_samples = (collective::GetRank() == 0) ? 0 : 1024;
+    bst_idx_t base_rowid = 0;
+    partitioner.Reset(&ctx, n_samples, base_rowid);
+    std::vector<RegTree::Node> splits(1);
+    dh::DeviceUVector<cuda_impl::RowIndexT> ridx_tmp(n_samples);
+    partitioner.UpdatePositionBatch(
+        &ctx, {0}, {1}, {2}, splits, dh::ToSpan(ridx_tmp),
+        [] XGBOOST_DEVICE(bst_idx_t ridx, RegTree::Node) { return ridx < 3; });
+    ASSERT_EQ(partitioner.GetNumNodes(), 3);
+    if (collective::GetRank() == 0) {
+      for (std::size_t i = 0; i < 3; ++i) {
+        ASSERT_TRUE(partitioner.GetRows(i).empty());
+      }
+    }
+    ctx.CUDACtx()->Stream().Sync();
   });
 }
+}  // anonymous namespace
 
-TEST(RowPartitionerDeathTest, IncorrectRow) {
-  ASSERT_DEATH({ TestIncorrectRow(); },".*");
+TEST(RowPartitioner, MGPUEmpty) {
+  std::int32_t n_workers = curt::AllVisibleGPUs();
+  TestEmptyNode(n_workers);
 }
-}  // namespace tree
-}  // namespace xgboost
+}  // namespace xgboost::tree

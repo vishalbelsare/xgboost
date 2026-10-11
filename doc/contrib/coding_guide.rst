@@ -16,8 +16,10 @@ C++ Coding Guideline
   * Each line of text may contain up to 100 characters.
   * The use of C++ exceptions is allowed.
 
-- Use C++11 features such as smart pointers, braced initializers, lambda functions, and ``std::thread``.
+- Use C++17 features such as smart pointers, braced initializers, lambda functions, and ``std::thread``.
 - Use Doxygen to document all the interface code.
+- We have some comments around symbols imported by headers, some of those are hinted by `include-what-you-use <https://include-what-you-use.org>`_. It's not required.
+- We use clang-tidy. Its configuration lives in the root directory of the XGBoost source tree.
 - We have a series of automatic checks to ensure that all of our codebase complies with the Google style. Before submitting your pull request, you are encouraged to run the style checks on your machine. See :ref:`running_checks_locally`.
 
 ***********************
@@ -38,12 +40,6 @@ Code Style
 
   - This is mainly to be consistent with the rest of the project.
   - Another reason is we will be able to check style automatically with a linter.
-
-- You can check the style of the code by typing the following command at root folder.
-
-  .. code-block:: bash
-
-    make rcpplint
 
 - When needed, you can disable the linter warning of certain line with ``// NOLINT(*)`` comments.
 - We use `roxygen <https://cran.r-project.org/web/packages/roxygen2/vignettes/roxygen2.html>`_ for documenting the R package.
@@ -79,15 +75,39 @@ The following steps are followed to add a new Rmarkdown vignettes:
 
 The reason we do this is to avoid exploded repo size due to generated images.
 
+
 R package versioning
 ====================
 See :ref:`release`.
+
+Testing R package with different compilers
+==========================================
+
+You can change the default compiler of R by changing the configuration file in home
+directory. For instance, if you want to test XGBoost built with clang++ instead of g++ on
+Linux, put the following in your ``~/.R/Makevars`` file:
+
+.. code-block:: sh
+
+  CC=clang-15
+  CXX17=clang++-15
+
+Be aware that the variable name should match with the name used by ``R CMD``:
+
+.. code-block:: sh
+
+  R CMD config CXX17
 
 Registering native routines in R
 ================================
 According to `R extension manual <https://cran.r-project.org/doc/manuals/r-release/R-exts.html#Registering-native-routines>`_,
 it is good practice to register native routines and to disable symbol search. When any changes or additions are made to the
 C++ interface of the R package, please make corresponding changes in ``src/init.c`` as well.
+
+Generating the Package and Running Tests
+========================================
+
+The source layout of XGBoost is a bit unusual to normal R packages as XGBoost is primarily written in C++ with multiple language bindings in mind. As a result, some special cares need to be taken to generate a standard R tarball. Most of the tests are being run on CI, and as a result, the best way to see how things work is by looking at the CI configuration files (GitHub action, at the time of writing). There are helper scripts in ``ops/script`` and ``R-package/tests/helper_scripts`` for running various checks including linter and making the standard tarball.
 
 *********************************
 Running Formatting Checks Locally
@@ -96,43 +116,90 @@ Running Formatting Checks Locally
 Once you submit a pull request to `dmlc/xgboost <https://github.com/dmlc/xgboost>`_, we perform
 two automatic checks to enforce coding style conventions. To expedite the code review process, you are encouraged to run the checks locally on your machine prior to submitting your pull request.
 
+Pre-commit
+==========
+We provide a `pre-commit <https://pre-commit.com/>`_ configuration for basic formatting,
+linting, and file-sanity checks. By default, pre-commit runs on files that are staged for commit,
+and the hooks in this repository are configured accordingly. To run on modified or untracked files,
+you can use ``pre-commit run --files <path> [...]`` or ``pre-commit run --all-files``.
+
+To enable it locally:
+
+.. code-block:: bash
+
+  python -m pip install pre-commit
+  pre-commit install
+
+To run it on the files you have staged for commit:
+
+.. code-block:: bash
+
+  pre-commit run
+
+To run it on a specific range of commits (e.g. in CI or for a local comparison):
+
+.. code-block:: bash
+
+  pre-commit run --from-ref <base> --to-ref <head>
+
 Linter
 ======
-We use `pylint <https://github.com/PyCQA/pylint>`_ and `cpplint <https://github.com/cpplint/cpplint>`_ to enforce style convention and find potential errors. Linting is especially useful for Python, as we can catch many errors that would have otherwise occured at run-time.
+We use a combination of linters to enforce style convention and find potential errors. Linting is especially useful for scripting languages like Python, as we can catch many errors that would have otherwise occurred at run-time.
 
-To run this check locally, run the following command from the top level source tree:
+For Python scripts, `pylint <https://github.com/PyCQA/pylint>`_, `ruff <https://github.com/astral-sh/ruff>`__ are used for providing guidance on coding style, and `mypy <https://github.com/python/mypy>`__ is required for type checking. The Python formatting and pylint checks are provided via the corresponding pre-commit hooks, which operate on changed files. For C++, `cpplint <https://github.com/cpplint/cpplint>`_ is used along with ``clang-tidy``. For R, ``lintr`` is used.
+
+To run Python checks locally, install the checkers mentioned previously and run the pre-commit hooks for the files you changed:
 
 .. code-block:: bash
 
   cd /path/to/xgboost/
-  make lint
+  pre-commit run
 
-This command requires the Python packages pylint and cpplint.
+To run checks for R:
+
+.. code-block:: bash
+
+  cd /path/to/xgboost/
+  R CMD INSTALL R-package/
+  Rscript ops/script/lint_r.R $(pwd)
+
+To run checks for cpplint locally:
+
+.. code-block:: bash
+
+  cd /path/to/xgboost/
+  python ./ops/script/lint_cpp.py
+
+
+Lastly, the linter for jvm-packages is integrated into the maven build process.
+
 
 Clang-tidy
 ==========
 `Clang-tidy <https://clang.llvm.org/extra/clang-tidy/>`_ is an advance linter for C++ code, made by the LLVM team. We use it to conform our C++ codebase to modern C++ practices and conventions.
 
-To run this check locally, run the following command from the top level source tree:
+To run this check locally, use the clang-CUDA helper from the top level source tree:
 
 .. code-block:: bash
 
   cd /path/to/xgboost/
-  python3 tests/ci_build/tidy.py
+  bash ops/pipeline/run-clang-tidy-clang-cuda.sh
 
-Also, the script accepts two optional integer arguments, namely ``--cpp`` and ``--cuda``. By default they are both set to 1, meaning that both C++ and CUDA code will be checked. If the CUDA toolkit is not installed on your machine, you'll encounter an error. To exclude CUDA source from linting, use:
+This helper configures a clang-generated CUDA compilation database and then runs
+``run-clang-tidy -p`` against files under ``src/`` using the repository's
+``.clang-tidy`` configuration. The same path is used by CI.
 
-.. code-block:: bash
-
-  cd /path/to/xgboost/
-  python3 tests/ci_build/tidy.py --cuda=0
-
-Similarly, if you want to exclude C++ source from linting:
+Use ``--jobs`` to override the number of parallel clang-tidy processes:
 
 .. code-block:: bash
 
   cd /path/to/xgboost/
-  python3 tests/ci_build/tidy.py --cpp=0
+  bash ops/pipeline/run-clang-tidy-clang-cuda.sh --jobs 16
+
+The helper expects a clang toolchain with ``clang++``, ``clang-linker-wrapper``, and
+``run-clang-tidy`` available either from the active conda base environment or from
+``XGBOOST_CLANG_PREFIX``. By default, it installs ``clang``, ``clangxx``, and
+``clang-tools`` from the ``conda-forge`` channel.
 
 **********************************
 Guide for handling user input data

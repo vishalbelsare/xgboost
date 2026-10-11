@@ -1,14 +1,14 @@
-/*!
- * Copyright 2015 by Contributors
- * \file objective.cc
- * \brief Registry of all objective functions.
+/**
+ * Copyright 2015-2025, XGBoost Contributors
+ *
+ * @brief Registry of all objective functions.
  */
-#include <xgboost/objective.h>
 #include <dmlc/registry.h>
+#include <xgboost/context.h>
+#include <xgboost/objective.h>
 
-#include <sstream>
-
-#include "xgboost/host_device_vector.h"
+#include <sstream>  // for stringstream
+#include <string>   // for string
 
 namespace dmlc {
 DMLC_REGISTRY_ENABLE(::xgboost::ObjFunctionReg);
@@ -16,36 +16,67 @@ DMLC_REGISTRY_ENABLE(::xgboost::ObjFunctionReg);
 
 namespace xgboost {
 // implement factory functions
-ObjFunction* ObjFunction::Create(const std::string& name, GenericParameter const* tparam) {
-  auto *e = ::dmlc::Registry< ::xgboost::ObjFunctionReg>::Get()->Find(name);
+ObjFunction* ObjFunction::Create(const std::string& name, Context const* ctx) {
+  std::string obj_name = name;
+  auto* e = ::dmlc::Registry< ::xgboost::ObjFunctionReg>::Get()->Find(obj_name);
   if (e == nullptr) {
     std::stringstream ss;
     for (const auto& entry : ::dmlc::Registry< ::xgboost::ObjFunctionReg>::List()) {
       ss << "Objective candidate: " << entry->name << "\n";
     }
-    LOG(FATAL) << "Unknown objective function: `" << name << "`\n"
-               << ss.str();
+    LOG(FATAL) << "Unknown objective function: `" << name << "`\n" << ss.str();
   }
   auto pobj = (e->body)();
-  pobj->tparam_ = tparam;
+  pobj->ctx_ = ctx;
   return pobj;
 }
 
+void ObjFunction::InitEstimation(MetaInfo const& info, linalg::Vector<float>* base_score) const {
+  CHECK(base_score);
+  auto n_targets = this->Targets(info);
+  *base_score = linalg::Constant(this->ctx_, DefaultBaseScore(), n_targets);
+}
 }  // namespace xgboost
 
 namespace xgboost {
 namespace obj {
 // List of files that will be force linked in static links.
+DMLC_REGISTRY_LINK_TAG(aft_obj);
+DMLC_REGISTRY_LINK_TAG(absolute_error_obj);
+DMLC_REGISTRY_LINK_TAG(expectile_obj);
+DMLC_REGISTRY_LINK_TAG(gamma_obj);
+DMLC_REGISTRY_LINK_TAG(hinge_obj);
+DMLC_REGISTRY_LINK_TAG(logistic_obj);
+DMLC_REGISTRY_LINK_TAG(normal_obj);
+DMLC_REGISTRY_LINK_TAG(poisson_obj);
+DMLC_REGISTRY_LINK_TAG(pseudohuber_obj);
+DMLC_REGISTRY_LINK_TAG(quantile_obj);
+DMLC_REGISTRY_LINK_TAG(squared_error_obj);
+DMLC_REGISTRY_LINK_TAG(squared_log_obj);
+DMLC_REGISTRY_LINK_TAG(tweedie_obj);
+DMLC_REGISTRY_LINK_TAG(multiclass_obj);
 #ifdef XGBOOST_USE_CUDA
+DMLC_REGISTRY_LINK_TAG(aft_kernel_cuda);
+DMLC_REGISTRY_LINK_TAG(expectile_kernel_cuda);
 DMLC_REGISTRY_LINK_TAG(regression_obj_gpu);
-DMLC_REGISTRY_LINK_TAG(hinge_obj_gpu);
-DMLC_REGISTRY_LINK_TAG(multiclass_obj_gpu);
-DMLC_REGISTRY_LINK_TAG(rank_obj_gpu);
+DMLC_REGISTRY_LINK_TAG(radix_select_kernel_cuda);
+DMLC_REGISTRY_LINK_TAG(quantile_kernel_cuda);
+DMLC_REGISTRY_LINK_TAG(gamma_kernel_cuda);
+DMLC_REGISTRY_LINK_TAG(hinge_kernel_cuda);
+DMLC_REGISTRY_LINK_TAG(logistic_kernel_cuda);
+DMLC_REGISTRY_LINK_TAG(normal_kernel_cuda);
+DMLC_REGISTRY_LINK_TAG(poisson_kernel_cuda);
+DMLC_REGISTRY_LINK_TAG(pseudohuber_kernel_cuda);
+DMLC_REGISTRY_LINK_TAG(squared_error_kernel_cuda);
+DMLC_REGISTRY_LINK_TAG(squared_log_kernel_cuda);
+DMLC_REGISTRY_LINK_TAG(tweedie_kernel_cuda);
+DMLC_REGISTRY_LINK_TAG(absolute_error_kernel_cuda);
+DMLC_REGISTRY_LINK_TAG(multiclass_kernel_cuda);
+DMLC_REGISTRY_LINK_TAG(lambdarank_obj);
+DMLC_REGISTRY_LINK_TAG(lambdarank_obj_cu);
 #else
 DMLC_REGISTRY_LINK_TAG(regression_obj);
-DMLC_REGISTRY_LINK_TAG(hinge_obj);
-DMLC_REGISTRY_LINK_TAG(multiclass_obj);
-DMLC_REGISTRY_LINK_TAG(rank_obj);
+DMLC_REGISTRY_LINK_TAG(lambdarank_obj);
 #endif  // XGBOOST_USE_CUDA
 }  // namespace obj
 }  // namespace xgboost

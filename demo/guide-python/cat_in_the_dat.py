@@ -1,4 +1,8 @@
-"""A simple demo for categorical data support using dataset from Kaggle categorical data
+"""
+Train XGBoost with cat_in_the_dat dataset
+=========================================
+
+A simple demo for categorical data support using dataset from Kaggle categorical data
 tutorial.
 
 The excellent tutorial is at:
@@ -7,21 +11,25 @@ https://www.kaggle.com/shahules/an-overview-of-encoding-techniques
 And the data can be found at:
 https://www.kaggle.com/shahules/an-overview-of-encoding-techniques/data
 
-Also, see the tutorial for using XGBoost with categorical data:
-https://xgboost.readthedocs.io/en/latest/tutorials/categorical.html
+  .. versionadded:: 1.6.0
 
-    .. versionadded 1.6.0
+See Also
+--------
+- :doc:`Tutorial </tutorials/categorical>`
+- :ref:`sphx_glr_python_examples_categorical.py`
+- :ref:`sphx_glr_python_examples_cat_pipeline.py`
 
 """
 
 from __future__ import annotations
-from time import time
+
 import os
 from tempfile import TemporaryDirectory
+from time import time
 
 import pandas as pd
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
 
 import xgboost as xgb
 
@@ -57,7 +65,12 @@ def load_cat_in_the_dat() -> tuple[pd.DataFrame, pd.Series]:
     return X, y
 
 
-params = {"tree_method": "gpu_hist", "use_label_encoder": False, "n_estimators": 32}
+params = {
+    "tree_method": "hist",
+    "device": "cuda",
+    "n_estimators": 32,
+    "colsample_bylevel": 0.7,
+}
 
 
 def categorical_model(X: pd.DataFrame, y: pd.Series, output_dir: str) -> None:
@@ -65,14 +78,18 @@ def categorical_model(X: pd.DataFrame, y: pd.Series, output_dir: str) -> None:
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, random_state=1994, test_size=0.2
     )
-    # Specify `enable_categorical`.
-    clf = xgb.XGBClassifier(**params, enable_categorical=True)
-    clf.fit(
-        X_train,
-        y_train,
-        eval_set=[(X_test, y_test), (X_train, y_train)],
+    # Be aware that the encoding for X_train and X_test are the same here. In practice,
+    # we should try to use an encoder like (sklearn OrdinalEncoder) to obtain the
+    # categorical values.
+
+    # Specify `enable_categorical` to True.
+    clf = xgb.XGBClassifier(
+        **params,
         eval_metric="auc",
+        enable_categorical=True,
+        max_cat_to_onehot=1,  # We use optimal partitioning exclusively
     )
+    clf.fit(X_train, y_train, eval_set=[(X_test, y_test), (X_train, y_train)])
     clf.save_model(os.path.join(output_dir, "categorical.json"))
 
     y_score = clf.predict_proba(X_test)[:, 1]  # proba of positive samples
@@ -85,13 +102,12 @@ def onehot_encoding_model(X: pd.DataFrame, y: pd.Series, output_dir: str) -> Non
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, random_state=42, test_size=0.2
     )
-    # Specify `enable_categorical`.
-    clf = xgb.XGBClassifier(**params, enable_categorical=False)
+    # Specify `enable_categorical` to False as we are using encoded data.
+    clf = xgb.XGBClassifier(**params, eval_metric="auc", enable_categorical=False)
     clf.fit(
         X_train,
         y_train,
         eval_set=[(X_test, y_test), (X_train, y_train)],
-        eval_metric="auc",
     )
     clf.save_model(os.path.join(output_dir, "one-hot.json"))
 

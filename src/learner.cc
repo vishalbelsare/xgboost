@@ -1,253 +1,499 @@
-/*!
- * Copyright 2014-2021 by Contributors
+/**
+ * Copyright 2014-2026, XGBoost Contributors
  * \file learner.cc
  * \brief Implementation of learning algorithm.
  * \author Tianqi Chen
  */
-#include <dmlc/io.h>
-#include <dmlc/parameter.h>
-#include <dmlc/thread_local.h>
-
-#include <atomic>
-#include <mutex>
-#include <algorithm>
-#include <iomanip>
-#include <limits>
-#include <memory>
-#include <sstream>
-#include <string>
-#include <stack>
-#include <utility>
-#include <vector>
-
-#include "dmlc/any.h"
-#include "xgboost/base.h"
-#include "xgboost/c_api.h"
-#include "xgboost/data.h"
-#include "xgboost/model.h"
-#include "xgboost/predictor.h"
-#include "xgboost/feature_map.h"
-#include "xgboost/gbm.h"
-#include "xgboost/generic_parameters.h"
-#include "xgboost/host_device_vector.h"
-#include "xgboost/json.h"
 #include "xgboost/learner.h"
-#include "xgboost/logging.h"
-#include "xgboost/metric.h"
-#include "xgboost/objective.h"
-#include "xgboost/parameter.h"
 
-#include "common/common.h"
-#include "common/io.h"
-#include "common/observer.h"
-#include "common/random.h"
-#include "common/timer.h"
-#include "common/charconv.h"
-#include "common/version.h"
-#include "common/threading_utils.h"
+#include <dmlc/io.h>            // for Stream
+#include <dmlc/parameter.h>     // for FieldEntry, DMLC_DECLARE_FIELD, Parameter, DMLC...
+#include <dmlc/thread_local.h>  // for ThreadLocalStore
 
+#include <algorithm>      // for equal, max, transform, sort, find_if, all_of
+#include <atomic>         // for atomic
+#include <cctype>         // for isalpha, isspace
+#include <cmath>          // for isnan, isinf
+#include <cstdint>        // for int32_t, uint32_t, int64_t, uint64_t
+#include <cstdlib>        // for atoi
+#include <cstring>        // for memcpy, size_t, memset
+#include <iomanip>        // for operator<<, setiosflags
+#include <iterator>       // for back_insert_iterator, distance, back_inserter
+#include <limits>         // for numeric_limits
+#include <memory>         // for allocator, unique_ptr, shared_ptr, operator==
+#include <mutex>          // for mutex, lock_guard
+#include <sstream>        // for operator<<, basic_ostream, basic_ostream::opera...
+#include <string>         // for basic_string, char_traits, operator<, string
+#include <system_error>   // for errc
+#include <unordered_map>  // for operator!=, unordered_map
+#include <utility>        // for pair, as_const, move, swap
+#include <vector>         // for vector
+
+#include "collective/aggregator.h"        // for GlobalMax
+#include "collective/allreduce.h"         // for Allreduce, SafeColl
+#include "collective/broadcast.h"         // for Broadcast
+#include "collective/communicator-inl.h"  // for GetRank, IsDistributed
+#include "common/api_entry.h"             // for XGBAPIThreadLocalEntry
+#include "common/charconv.h"              // for to_chars, to_chars_result, NumericLimits, from_...
+#include "common/error_msg.h"             // for MaxFeatureSize, WarnOldSerialization, ...
+#include "common/io.h"                    // for PeekableInStream, ReadAll, FixedSizeStream, Mem...
+#include "common/observer.h"              // for TrainingObserver
+#include "common/param_array.h"           // for ParamArray
+#include "common/timer.h"                 // for Monitor
+#include "common/version.h"               // for Version
+#include "xgboost/base.h"                 // for Args, GradientPair, bst_feature_t
+#include "xgboost/context.h"              // for Context
+#include "xgboost/data.h"                 // for DMatrix, MetaInfo
+#include "xgboost/gbm.h"                  // for GradientBooster
+#include "xgboost/global_config.h"        // for GlobalConfiguration, GlobalConfigThreadLocalStore
+#include "xgboost/host_device_vector.h"   // for HostDeviceVector
+#include "xgboost/json.h"                 // for Json, get, Object, String, IsA, Array, ToJson
+#include "xgboost/linalg.h"               // for Vector, VectorView
+#include "xgboost/logging.h"              // for CHECK, LOG, CHECK_EQ
+#include "xgboost/metric.h"               // for Metric
+#include "xgboost/objective.h"            // for ObjFunction
+#include "xgboost/parameter.h"            // for DECLARE_FIELD_ENUM_CLASS, XGBoostParameter
+#include "xgboost/string_view.h"          // for operator<<, StringView
+#include "xgboost/task.h"                 // for ObjInfo
+
+DECLARE_FIELD_ENUM_CLASS(xgboost::MultiStrategy);
+
+namespace xgboost {
+Learner::~Learner() = default;
 namespace {
+StringView ModelNotFitted() { return "Model is not yet initialized (not fitted)."; }
 
-const char* kMaxDeltaStepDefaultValue = "0.7";
+template <typename T>
+T& UsePtr(T& ptr) {  // NOLINT
+  CHECK(ptr);
+  return ptr;
+}
 }  // anonymous namespace
 
-namespace xgboost {
-
-enum class DataSplitMode : int {
-  kAuto = 0, kCol = 1, kRow = 2
-};
-}  // namespace xgboost
-
-DECLARE_FIELD_ENUM_CLASS(xgboost::DataSplitMode);
-
-namespace xgboost {
-// implementation of base learner.
-bool Learner::AllowLazyCheckPoint() const {
-  return gbm_->AllowLazyCheckPoint();
+LearnerModelState::LearnerModelState(Context const* ctx, bst_feature_t n_features,
+                                     std::int32_t n_classes, bst_target_t n_targets,
+                                     bool boost_from_average, std::vector<float> base_score_value,
+                                     linalg::Vector<float> base_score, ObjInfo task,
+                                     MultiStrategy multi_strategy)
+    : num_feature{n_features},
+      num_class{n_classes},
+      num_target{n_targets},
+      boost_from_average{boost_from_average},
+      num_output_group{std::max(
+          {n_targets, static_cast<bst_target_t>(n_classes), static_cast<bst_target_t>(1)})},
+      task{task},
+      multi_strategy{multi_strategy} {
+  if (num_class > 1 && num_target > 1) {
+    LOG(FATAL) << "multi-target-multi-class is not yet supported. Output classes:" << num_class
+               << ", output targets:" << num_target;
+  }
+  this->SetBaseScore(ctx, std::move(base_score_value), std::move(base_score));
 }
 
-Learner::~Learner() = default;
+void LearnerModelState::SetBaseScore(Context const* ctx, std::vector<float> value,
+                                     linalg::Vector<float> base_score) {
+  base_score_value_ = std::move(value);
+  std::swap(base_score_, base_score);
+  this->ConfigureDevice(ctx);
+}
 
-/*! \brief training parameter for regression
- *
- * Should be deprecated, but still used for being compatible with binary IO.
- * Once it's gone, `LearnerModelParam` should handle transforming `base_margin`
- * with objective by itself.
- */
-struct LearnerModelParamLegacy : public dmlc::Parameter<LearnerModelParamLegacy> {
-  /* \brief global bias */
-  bst_float base_score;
-  /* \brief number of features  */
-  uint32_t num_feature;
-  /* \brief number of classes, if it is multi-class classification  */
-  int32_t num_class;
-  /*! \brief Model contain additional properties */
-  int32_t contain_extra_attrs;
-  /*! \brief Model contain eval metrics */
-  int32_t contain_eval_metrics;
-  /*! \brief the version of XGBoost. */
-  uint32_t major_version;
-  uint32_t minor_version;
-  /*! \brief reserved field */
-  int reserved[27];
-  /*! \brief constructor */
-  LearnerModelParamLegacy() {
-    std::memset(this, 0, sizeof(LearnerModelParamLegacy));
-    base_score = 0.5f;
-    major_version = std::get<0>(Version::Self());
-    minor_version = std::get<1>(Version::Self());
-    static_assert(sizeof(LearnerModelParamLegacy) == 136,
-                  "Do not change the size of this struct, as it will break binary IO.");
+void LearnerModelState::ConfigureDevice(Context const* ctx) {
+  if (base_score_.Device() != ctx->Device()) {
+    auto const& h_base_score = std::as_const(base_score_).Data()->ConstHostVector();
+    linalg::Vector<float> base_score{
+        h_base_score.cbegin(), h_base_score.cend(), {h_base_score.size()}, ctx->Device()};
+    std::swap(base_score_, base_score);
   }
-  // Skip other legacy fields.
-  Json ToJson() const {
-    Object obj;
-    char floats[NumericLimits<float>::kToCharsSize];
-    auto ret = to_chars(floats, floats + NumericLimits<float>::kToCharsSize, base_score);
-    CHECK(ret.ec == std::errc());
-    obj["base_score"] =
-        std::string{floats, static_cast<size_t>(std::distance(floats, ret.ptr))};
+  // Make sure read access everywhere for thread-safe prediction.
+  std::as_const(base_score_).HostView();
+  if (!ctx->IsCPU()) {
+    std::as_const(base_score_).View(ctx->Device());
+  }
+  CHECK(std::as_const(base_score_).Data()->HostCanRead());
+}
 
-    char integers[NumericLimits<int64_t>::kToCharsSize];
-    ret = to_chars(integers, integers + NumericLimits<int64_t>::kToCharsSize,
-                   static_cast<int64_t>(num_feature));
-    CHECK(ret.ec == std::errc());
-    obj["num_feature"] =
-        std::string{integers, static_cast<size_t>(std::distance(integers, ret.ptr))};
-    ret = to_chars(integers, integers + NumericLimits<int64_t>::kToCharsSize,
-                   static_cast<int64_t>(num_class));
-    CHECK(ret.ec == std::errc());
-    obj["num_class"] =
-        std::string{integers, static_cast<size_t>(std::distance(integers, ret.ptr))};
-    return Json(std::move(obj));
+linalg::VectorView<float const> LearnerModelState::BaseScore(DeviceOrd device) const {
+  // multi-class is not yet supported.
+  CHECK_GE(base_score_.Size(), 1) << ModelNotFitted();
+  if (device.IsCPU()) {
+    // Make sure that we won't run into race condition.
+    CHECK(base_score_.Data()->HostCanRead());
+    return base_score_.HostView();
   }
-  void FromJson(Json const& obj) {
-    auto const& j_param = get<Object const>(obj);
-    std::map<std::string, std::string> m;
-    m["num_feature"] = get<String const>(j_param.at("num_feature"));
-    m["num_class"] = get<String const>(j_param.at("num_class"));
-    this->Init(m);
-    std::string str = get<String const>(j_param.at("base_score"));
-    from_chars(str.c_str(), str.c_str() + str.size(), base_score);
+  // Make sure that we won't run into race condition.
+  CHECK(base_score_.Data()->DeviceCanRead());
+  auto v = base_score_.View(device);
+  CHECK(base_score_.Data()->HostCanRead());  // make sure read access is not removed.
+  return v;
+}
+
+linalg::VectorView<float const> LearnerModelState::BaseScore(Context const* ctx) const {
+  return this->BaseScore(ctx->Device());
+}
+
+void LearnerModelState::Copy(LearnerModelState const& that) {
+  base_score_.Reshape(that.base_score_.Shape());
+  base_score_.Data()->SetDevice(that.base_score_.Device());
+  base_score_.Data()->Copy(*that.base_score_.Data());
+  std::as_const(base_score_).HostView();
+  if (!that.base_score_.Device().IsCPU()) {
+    std::as_const(base_score_).View(that.base_score_.Device());
   }
-  inline LearnerModelParamLegacy ByteSwap() const {
-    LearnerModelParamLegacy x = *this;
-    dmlc::ByteSwap(&x.base_score, sizeof(x.base_score), 1);
-    dmlc::ByteSwap(&x.num_feature, sizeof(x.num_feature), 1);
-    dmlc::ByteSwap(&x.num_class, sizeof(x.num_class), 1);
-    dmlc::ByteSwap(&x.contain_extra_attrs, sizeof(x.contain_extra_attrs), 1);
-    dmlc::ByteSwap(&x.contain_eval_metrics, sizeof(x.contain_eval_metrics), 1);
-    dmlc::ByteSwap(&x.major_version, sizeof(x.major_version), 1);
-    dmlc::ByteSwap(&x.minor_version, sizeof(x.minor_version), 1);
-    dmlc::ByteSwap(x.reserved, sizeof(x.reserved[0]), sizeof(x.reserved) / sizeof(x.reserved[0]));
-    return x;
+  CHECK_EQ(base_score_.Data()->DeviceCanRead(), that.base_score_.Data()->DeviceCanRead());
+  CHECK(base_score_.Data()->HostCanRead());
+
+  base_score_value_ = that.base_score_value_;
+  num_feature = that.num_feature;
+  num_class = that.num_class;
+  num_target = that.num_target;
+  boost_from_average = that.boost_from_average;
+  num_output_group = that.num_output_group;
+  task = that.task;
+  multi_strategy = that.multi_strategy;
+}
+
+struct LearnerTrainParam : public XGBoostParameter<LearnerTrainParam> {
+  // Parameters consumed when the model state is initialized.
+  common::ParamArray<float> base_score{"base_score"};
+  std::int32_t num_class{0};
+  bst_target_t num_target{1};
+  std::int32_t boost_from_average{true};
+
+  // flag to disable default metric
+  bool disable_default_eval_metric{false};
+  std::string booster;
+  std::string objective;
+  // This is a training parameter and is not saved (nor loaded) in the model.
+  MultiStrategy multi_strategy{MultiStrategy::kOneOutputPerTree};
+
+  template <typename Container>
+  Args UpdateAllowUnknown(Container const& kwargs) {
+    auto has_key = [&kwargs](char const* key) {
+      return std::find_if(kwargs.cbegin(), kwargs.cend(),
+                          [key](auto const& kv) { return kv.first == key; }) != kwargs.cend();
+    };
+    auto unknown = XGBoostParameter<LearnerTrainParam>::UpdateAllowUnknown(kwargs);
+    // An explicit boost_from_average takes precedence when both parameters are supplied.
+    if (has_key("base_score") && !has_key("boost_from_average")) {
+      this->boost_from_average = false;
+    }
+    return unknown;
   }
 
-  // declare parameters
-  DMLC_DECLARE_PARAMETER(LearnerModelParamLegacy) {
+  [[nodiscard]] bst_target_t OutputLength() const noexcept {
+    return std::max({this->num_target, static_cast<bst_target_t>(this->num_class),
+                     static_cast<bst_target_t>(1)});
+  }
+
+  DMLC_DECLARE_PARAMETER(LearnerTrainParam) {
     DMLC_DECLARE_FIELD(base_score)
-        .set_default(0.5f)
-        .describe("Global bias of the model.");
-    DMLC_DECLARE_FIELD(num_feature)
-        .set_default(0)
-        .describe(
-            "Number of features in training data,"
-            " this parameter will be automatically detected by learner.");
+        .describe("Global bias of the model.")
+        .set_default(common::ParamArray<float>{"base_score"});
     DMLC_DECLARE_FIELD(num_class).set_default(0).set_lower_bound(0).describe(
         "Number of class option for multi-class classifier. "
         " By default equals 0 and corresponds to binary classifier.");
-  }
-};
-
-LearnerModelParam::LearnerModelParam(LearnerModelParamLegacy const& user_param, float base_margin,
-                                     ObjInfo t)
-    : base_score{base_margin},
-      num_feature{user_param.num_feature},
-      num_output_group{user_param.num_class == 0 ? 1 : static_cast<uint32_t>(user_param.num_class)},
-      task{t} {}
-
-struct LearnerTrainParam : public XGBoostParameter<LearnerTrainParam> {
-  // data split mode, can be row, col, or none.
-  DataSplitMode dsplit {DataSplitMode::kAuto};
-  // flag to disable default metric
-  bool disable_default_eval_metric {false};
-  // FIXME(trivialfis): The following parameters belong to model itself, but can be
-  // specified by users.  Move them to model parameter once we can get rid of binary IO.
-  std::string booster;
-  std::string objective;
-
-  // declare parameters
-  DMLC_DECLARE_PARAMETER(LearnerTrainParam) {
-    DMLC_DECLARE_FIELD(dsplit)
-        .set_default(DataSplitMode::kAuto)
-        .add_enum("auto", DataSplitMode::kAuto)
-        .add_enum("col", DataSplitMode::kCol)
-        .add_enum("row", DataSplitMode::kRow)
-        .describe("Data split mode for distributed training.");
+    DMLC_DECLARE_FIELD(num_target)
+        .set_default(1)
+        .set_lower_bound(1)
+        .describe("Number of output targets. Can be set automatically if not specified.");
+    DMLC_DECLARE_FIELD(boost_from_average)
+        .set_default(true)
+        .describe("Whether we should calculate the base score from training data.");
     DMLC_DECLARE_FIELD(disable_default_eval_metric)
         .set_default(false)
         .describe("Flag to disable default metric. Set to >0 to disable");
-    DMLC_DECLARE_FIELD(booster)
-        .set_default("gbtree")
-        .describe("Gradient booster used for training.");
+    DMLC_DECLARE_FIELD(booster).set_default("gbtree").describe(
+        "Gradient booster used for training.");
     DMLC_DECLARE_FIELD(objective)
         .set_default("reg:squarederror")
         .describe("Objective function used for obtaining gradient.");
+    DMLC_DECLARE_FIELD(multi_strategy)
+        .add_enum("one_output_per_tree", MultiStrategy::kOneOutputPerTree)
+        .add_enum("multi_output_tree", MultiStrategy::kMultiOutputTree)
+        .set_default(MultiStrategy::kOneOutputPerTree)
+        .describe(
+            "Strategy used for training multi-target models. `multi_output_tree` means building "
+            "one single tree for all targets.");
   }
 };
 
-
-DMLC_REGISTER_PARAMETER(LearnerModelParamLegacy);
 DMLC_REGISTER_PARAMETER(LearnerTrainParam);
-DMLC_REGISTER_PARAMETER(GenericParameter);
-
-int constexpr GenericParameter::kCpuId;
-int64_t constexpr GenericParameter::kDefaultSeed;
-
-void GenericParameter::ConfigureGpuId(bool require_gpu) {
-#if defined(XGBOOST_USE_CUDA)
-  if (gpu_id == kCpuId) {  // 0. User didn't specify the `gpu_id'
-    if (require_gpu) {     // 1. `tree_method' or `predictor' or both are using
-                           // GPU.
-      // 2. Use device 0 as default.
-      this->UpdateAllowUnknown(Args{{"gpu_id", "0"}});
-    }
-  }
-
-  // 3. When booster is loaded from a memory image (Python pickle or R
-  // raw model), number of available GPUs could be different.  Wrap around it.
-  int32_t n_gpus = common::AllVisibleGPUs();
-  if (n_gpus == 0) {
-    if (gpu_id != kCpuId) {
-      LOG(WARNING) << "No visible GPU is found, setting `gpu_id` to -1";
-    }
-    this->UpdateAllowUnknown(Args{{"gpu_id", std::to_string(kCpuId)}});
-  } else if (fail_on_invalid_gpu_id) {
-    CHECK(gpu_id == kCpuId || gpu_id < n_gpus)
-      << "Only " << n_gpus << " GPUs are visible, gpu_id "
-      << gpu_id << " is invalid.";
-  } else if (gpu_id != kCpuId && gpu_id >= n_gpus) {
-    LOG(WARNING) << "Only " << n_gpus
-                 << " GPUs are visible, setting `gpu_id` to " << gpu_id % n_gpus;
-    this->UpdateAllowUnknown(Args{{"gpu_id", std::to_string(gpu_id % n_gpus)}});
-  }
-#else
-  // Just set it to CPU, don't think about it.
-  this->UpdateAllowUnknown(Args{{"gpu_id", std::to_string(kCpuId)}});
-#endif  // defined(XGBOOST_USE_CUDA)
-}
-
-int32_t GenericParameter::Threads() const {
-  return common::OmpGetNumThreads(nthread);
-}
 
 using LearnerAPIThreadLocalStore =
-    dmlc::ThreadLocalStore<std::map<Learner const *, XGBAPIThreadLocalEntry>>;
+    dmlc::ThreadLocalStore<std::map<Learner const*, XGBAPIThreadLocalEntry>>;
 
-using ThreadLocalPredictionCache =
-    dmlc::ThreadLocalStore<std::map<Learner const *, PredictionContainer>>;
+namespace {
+std::string CanonicalizeBoosterName(std::string booster) {
+  if (booster == "dart") {
+    static std::once_flag flag;
+    std::call_once(flag, [] {
+      LOG(WARNING) << "`booster=dart` is deprecated. Use the tree booster directly with "
+                      "dropout parameters like `rate_drop`, `skip_drop`, or `one_drop`.";
+    });
+    return "gbtree";
+  }
+  return booster;
+}
 
-class LearnerConfiguration : public Learner {
+/**
+ * @brief Handler for learner model inputs and state initialization.
+ */
+class LearnerModelStateContainer : public Learner {
+  using CacheT = std::vector<std::weak_ptr<DMatrix>>;
+
+ protected:
+  enum class InterceptInitialization { kEstimateIntercept, kUseDefaultIntercept };
+  /** @brief User-configurable inputs for constructing model state. */
+  LearnerTrainParam tparam_;
+  /** @brief Authoritative model state shared with the gradient booster. */
+  LearnerModelState model_state_;
+
+ private:
+  void InitEstimation(MetaInfo const& info, bst_target_t output_length,
+                      linalg::Vector<float>* base_score) {
+    base_score->SetDevice(this->Ctx()->Device());
+    base_score->Reshape(output_length);
+    UsePtr(obj_)->InitEstimation(info, base_score);
+  }
+
+  static void HandleOldFormat(std::vector<float>* base_score, bst_target_t output_length) {
+    if (base_score->size() == 1 && output_length > 1) {
+      base_score->resize(output_length, base_score->front());
+    }
+  }
+
+  [[nodiscard]] Json ModelStateToJson() const {
+    auto n_features = model_state_.Initialized() ? model_state_.num_feature : 0;
+    auto n_classes = model_state_.Initialized() ? model_state_.num_class : tparam_.num_class;
+    auto n_targets = model_state_.Initialized() ? model_state_.num_target : tparam_.num_target;
+    auto boost_from_average =
+        model_state_.Initialized() ? model_state_.boost_from_average : tparam_.boost_from_average;
+    std::vector<float> base_score;
+    if (model_state_.Initialized()) {
+      base_score = model_state_.BaseScoreValue();
+    } else {
+      base_score.assign(tparam_.base_score.cbegin(), tparam_.base_score.cend());
+    }
+
+    common::ParamArray<float> value{"base_score"};
+    value = base_score;
+    std::stringstream ss;
+    ss << value;
+
+    Json out{Object{}};
+    out["base_score"] = ss.str();
+    out["num_feature"] = std::to_string(n_features);
+    out["num_class"] = std::to_string(n_classes);
+    out["num_target"] = std::to_string(n_targets);
+    out["boost_from_average"] = std::to_string(static_cast<std::int32_t>(boost_from_average));
+    return out;
+  }
+
+  void ValidateModelState() const {
+    CHECK(model_state_.Initialized()) << ModelNotFitted();
+    auto const& base_score = model_state_.BaseScoreValue();
+    CHECK_GE(base_score.size(), 1);
+    auto n_classes = static_cast<std::size_t>(model_state_.num_class);
+    auto n_targets = static_cast<std::size_t>(model_state_.num_target);
+    if (!(base_score.size() == n_classes || base_score.size() == n_targets)) {
+      error::InvalidIntercept(n_classes, n_targets, base_score.size());
+    }
+    CHECK(std::none_of(base_score.cbegin(), base_score.cend(),
+                       [](float v) { return std::isnan(v) || std::isinf(v); }));
+
+    if (!collective::IsDistributed()) {
+      return;
+    }
+    std::vector<char> data;
+    Json::Dump(this->ModelStateToJson(), &data, std::ios::binary);
+    std::vector<char> sync{data};
+    auto rc = collective::Broadcast(&ctx_, linalg::MakeVec(sync.data(), sync.size()), 0);
+    collective::SafeColl(rc);
+    CHECK(std::equal(data.cbegin(), data.cend(), sync.cbegin()))
+        << "Different model state across workers:\n\t"
+        << Json::Load(StringView{data.data(), data.size()}, std::ios::binary) << "\nvs.\n\t"
+        << Json::Load(StringView{sync.data(), sync.size()}, std::ios::binary);
+  }
+
+  void InitModelState(bst_feature_t n_features, std::int32_t n_classes, bst_target_t n_targets,
+                      bool boost_from_average, std::vector<float> base_score_value) {
+    auto output_length =
+        std::max({n_targets, static_cast<bst_target_t>(n_classes), static_cast<bst_target_t>(1)});
+    HandleOldFormat(&base_score_value, output_length);
+    linalg::Vector<float> base_score{base_score_value.cbegin(),
+                                     base_score_value.cend(),
+                                     {base_score_value.size()},
+                                     this->ctx_.Device()};
+    UsePtr(this->obj_)->ProbToMargin(&base_score);
+    model_state_ = LearnerModelState{Ctx(),
+                                     n_features,
+                                     n_classes,
+                                     n_targets,
+                                     boost_from_average,
+                                     std::move(base_score_value),
+                                     std::move(base_score),
+                                     UsePtr(this->obj_)->Task(),
+                                     tparam_.multi_strategy};
+    this->ValidateModelState();
+  }
+
+  [[nodiscard]] bst_feature_t InitNumFeatures(DMatrix const& train) const {
+    auto n_features = train.Info().num_col_;
+    error::MaxFeatureSize(n_features);
+    CHECK_NE(n_features, 0) << "0 feature is supplied. Are you using the raw Booster interface?";
+    return static_cast<bst_feature_t>(n_features);
+  }
+
+  [[nodiscard]] bst_target_t InitNumTargets(DMatrix* train, CacheT const& cache) const {
+    CHECK(this->obj_);
+    auto local_n_targets = this->obj_->Targets(train->Info());
+    auto n_targets = local_n_targets;
+    if (model_state_.Initialized()) {
+      CHECK(n_targets == 1 || n_targets == model_state_.num_target)
+          << "Inconsistent number of targets between data and model.";
+      n_targets = model_state_.num_target;
+    } else {
+      // An empty distributed worker can have no label columns and report the single-target
+      // fallback. Agree on the target count before sizing the model and its intercept.
+      n_targets = collective::GlobalMax(Ctx(), n_targets);
+      auto inconsistent =
+          static_cast<std::int32_t>(local_n_targets != n_targets && train->Info().num_row_ != 0);
+      inconsistent = collective::GlobalMax(Ctx(), inconsistent);
+      CHECK_EQ(inconsistent, 0) << "Inconsistent number of targets across workers.";
+      if (tparam_.num_target > 1) {
+        CHECK(n_targets == 1 || n_targets == tparam_.num_target)
+            << "Inconsistent configuration of the `num_target`.  Configuration result from input "
+            << "data:" << n_targets << ", configuration from parameters:" << tparam_.num_target;
+        n_targets = tparam_.num_target;
+      }
+    }
+
+    for (auto const& weak : cache) {
+      auto d = weak.lock();
+      if (!d) {
+        continue;
+      }
+      auto t = this->obj_->Targets(d->Info());
+      CHECK(n_targets == t || 1 == t) << "Inconsistent labels.";
+    }
+
+    if (train->Info().num_row_ == 0 && local_n_targets != n_targets) {
+      // Preserve the target dimension on a label-less worker. Objectives can then continue to
+      // infer the authoritative count from labels without adding collectives to every call.
+      CHECK_EQ(train->Info().labels.Size(), 0);
+      train->Info().labels.Reshape(0, n_targets);
+      CHECK_EQ(this->obj_->Targets(train->Info()), n_targets);
+    }
+    return n_targets;
+  }
+
+ protected:
+  [[nodiscard]] Json SaveModelState() const { return this->ModelStateToJson(); }
+
+  void CheckModelInitialized() const { CHECK(model_state_.Initialized()) << ModelNotFitted(); }
+
+  void ConfigureModelState(LearnerTrainParam const& old_tparam, Args const& args) {
+    if (model_state_.NeedsInitialization()) {
+      return;
+    }
+    model_state_.ConfigureDevice(Ctx());
+    auto has = [&args](char const* key) {
+      return std::any_of(args.cbegin(), args.cend(),
+                         [key](auto const& kv) { return kv.first == key; });
+    };
+    bool model_input_changed =
+        has("base_score") || has("num_class") || has("num_target") || has("boost_from_average");
+    bool structure_changed = old_tparam.objective != tparam_.objective ||
+                             old_tparam.multi_strategy != tparam_.multi_strategy;
+    if (!model_input_changed && !structure_changed) {
+      return;
+    }
+
+    auto base_score = model_state_.BaseScoreValue();
+    auto n_classes = model_state_.num_class;
+    auto n_targets = model_state_.num_target;
+    auto boost_from_average = model_state_.boost_from_average;
+    if (has("base_score")) {
+      base_score.assign(tparam_.base_score.cbegin(), tparam_.base_score.cend());
+    }
+    if (has("num_class")) {
+      n_classes = tparam_.num_class;
+    }
+    if (has("num_target")) {
+      n_targets = tparam_.num_target;
+    }
+    if (has("boost_from_average") || has("base_score")) {
+      boost_from_average = tparam_.boost_from_average;
+    }
+    this->InitModelState(model_state_.num_feature, n_classes, n_targets, boost_from_average,
+                         std::move(base_score));
+  }
+
+  void InitializeModel(DMatrix* train, CacheT const& cache, InterceptInitialization mode) {
+    auto n_features = this->InitNumFeatures(*train);
+    auto n_targets = this->InitNumTargets(train, cache);
+    if (model_state_.Initialized()) {
+      return;
+    }
+
+    auto output_length = std::max(
+        {n_targets, static_cast<bst_target_t>(tparam_.num_class), static_cast<bst_target_t>(1)});
+    std::vector<float> base_score;
+    if (!tparam_.boost_from_average) {
+      base_score.assign(tparam_.base_score.cbegin(), tparam_.base_score.cend());
+    } else if (mode == InterceptInitialization::kEstimateIntercept) {
+      auto const& info = train->Info();
+      info.Validate(Ctx()->Device());
+      linalg::Vector<float> estimated;
+      this->InitEstimation(info, output_length, &estimated);
+      base_score = estimated.Data()->ConstHostVector();
+    } else {
+      base_score.resize(output_length, ObjFunction::DefaultBaseScore());
+    }
+    this->InitModelState(n_features, tparam_.num_class, n_targets, tparam_.boost_from_average,
+                         std::move(base_score));
+  }
+
+  void LoadModelState(Json const& in) {
+    auto const& values = get<Object const>(in);
+    common::ParamArray<float> base_score_param{"base_score"};
+    std::istringstream is{get<String const>(values.at("base_score"))};
+    is >> base_score_param;
+    CHECK(!is.fail()) << "Invalid base_score in model.";
+    std::vector<float> base_score{base_score_param.cbegin(), base_score_param.cend()};
+
+    auto n_features_value = std::stoull(get<String const>(values.at("num_feature")));
+    error::MaxFeatureSize(n_features_value);
+    auto n_features = static_cast<bst_feature_t>(n_features_value);
+    auto n_classes = std::stoi(get<String const>(values.at("num_class")));
+    CHECK_GE(n_classes, 0);
+    bst_target_t n_targets{1};
+    if (auto it = values.find("num_target"); it != values.cend()) {
+      auto value = std::stoull(get<String const>(it->second));
+      CHECK_LE(value, std::numeric_limits<bst_target_t>::max());
+      n_targets = static_cast<bst_target_t>(value);
+      CHECK_GE(n_targets, 1);
+    }
+    bool boost_from_average{true};
+    if (auto it = values.find("boost_from_average"); it != values.cend()) {
+      boost_from_average = std::stoi(get<String const>(it->second));
+    }
+
+    tparam_.base_score = base_score;
+    tparam_.num_class = n_classes;
+    tparam_.num_target = n_targets;
+    tparam_.boost_from_average = boost_from_average;
+    if (n_features == 0) {
+      model_state_ = LearnerModelState{};
+      return;
+    }
+    this->InitModelState(n_features, n_classes, n_targets, boost_from_average,
+                         std::move(base_score));
+  }
+};
+}  // namespace
+
+class LearnerConfiguration : public LearnerModelStateContainer {
  private:
   std::mutex config_lock_;
 
@@ -256,7 +502,6 @@ class LearnerConfiguration : public Learner {
 
  protected:
   std::atomic<bool> need_configuration_;
-  std::map<std::string, std::string> cfg_;
   // Stores information like best-iteration for early stopping.
   std::map<std::string, std::string> attributes_;
   // Name of each feature, usually set from DMatrix.
@@ -265,104 +510,97 @@ class LearnerConfiguration : public Learner {
   std::vector<std::string> feature_types_;
 
   common::Monitor monitor_;
-  LearnerModelParamLegacy mparam_;
-  LearnerModelParam learner_model_param_;
-  LearnerTrainParam tparam_;
+  // Initial prediction.
+  std::vector<std::weak_ptr<DMatrix>> cache_data_;
+
   std::vector<std::string> metric_names_;
 
  public:
-  explicit LearnerConfiguration(std::vector<std::shared_ptr<DMatrix> > cache)
+  explicit LearnerConfiguration(std::vector<std::shared_ptr<DMatrix>> cache)
       : need_configuration_{true} {
     monitor_.Init("Learner");
-    auto& local_cache = (*ThreadLocalPredictionCache::Get())[this];
     for (std::shared_ptr<DMatrix> const& d : cache) {
-      local_cache.Cache(d, GenericParameter::kCpuId);
-    }
-  }
-  ~LearnerConfiguration() override {
-    auto local_cache = ThreadLocalPredictionCache::Get();
-    if (local_cache->find(this) != local_cache->cend()) {
-      local_cache->erase(this);
+      if (d) {
+        cache_data_.emplace_back(d);
+      }
     }
   }
 
-  // Configuration before data is known.
-  void Configure() override {
-    // Varient of double checked lock
-    if (!this->need_configuration_) { return; }
+  void Configure(Args const& args = {}) override {
+    bool has_args = !args.empty();
+    if (has_args) {
+      this->need_configuration_ = true;
+    }
+
+    if (!has_args && !this->need_configuration_) {
+      return;
+    }
     std::lock_guard<std::mutex> guard(config_lock_);
-    if (!this->need_configuration_) { return; }
+    if (!has_args && !this->need_configuration_) {
+      return;
+    }
 
     monitor_.Start("Configure");
     auto old_tparam = tparam_;
-    Args args = {cfg_.cbegin(), cfg_.cend()};
+    std::map<std::string, std::string> config;
+    std::set<std::string> used;
 
-    tparam_.UpdateAllowUnknown(args);
-    auto mparam_backup = mparam_;
-
-    mparam_.UpdateAllowUnknown(args);
-
-    auto initialized = generic_parameters_.GetInitialised();
-    auto old_seed = generic_parameters_.seed;
-    generic_parameters_.UpdateAllowUnknown(args);
-
-    ConsoleLogger::Configure(args);
-    common::OmpSetNumThreads(&generic_parameters_.nthread);
-
-    // add additional parameters
-    // These are cosntraints that need to be satisfied.
-    if (tparam_.dsplit == DataSplitMode::kAuto && rabit::IsDistributed()) {
-      tparam_.dsplit = DataSplitMode::kRow;
+    for (auto const& [key, value] : args) {
+      if (key == kEvalMetric) {
+        used.insert(kEvalMetric);
+        if (std::find(metric_names_.cbegin(), metric_names_.cend(), value) ==
+            metric_names_.cend()) {
+          metric_names_.emplace_back(value);
+        }
+      } else {
+        config[key] = value;
+      }
     }
+
+    Args config_args{config.cbegin(), config.cend()};
+
+    used.merge(UpdateAndGetUsedParameters(&tparam_, config_args));
+
+    auto initialized = ctx_.GetInitialised();
+    auto old_seed = ctx_.seed;
+    used.merge(UpdateAndGetUsedParameters(&ctx_, config_args));
+
+    used.merge(ConsoleLogger::Configure(config_args));
 
     // set seed only before the model is initialized
-    if (!initialized || generic_parameters_.seed != old_seed) {
-      common::GlobalRandom().seed(generic_parameters_.seed);
+    if (!initialized || ctx_.seed != old_seed) {
+      ctx_.Rng().seed(ctx_.seed);
     }
 
-    // must precede configure gbm since num_features is required for gbm
-    this->ConfigureNumFeatures();
-    args = {cfg_.cbegin(), cfg_.cend()};  // renew
-    this->ConfigureObjective(old_tparam, &args);
+    used.merge(this->ConfigureObjective(old_tparam, &config, &config_args));
 
-    // Before 1.0.0, we save `base_score` into binary as a transformed value by objective.
-    // After 1.0.0 we save the value provided by user and keep it immutable instead.  To
-    // keep the stability, we initialize it in binary LoadModel instead of configuration.
-    // Under what condition should we omit the transformation:
-    //
-    // - base_score is loaded from old binary model.
-    //
-    // What are the other possible conditions:
-    //
-    // - model loaded from new binary or JSON.
-    // - model is created from scratch.
-    // - model is configured second time due to change of parameter
-    if (!learner_model_param_.Initialized() || mparam_.base_score != mparam_backup.base_score) {
-      learner_model_param_ =
-          LearnerModelParam(mparam_, obj_->ProbToMargin(mparam_.base_score), obj_->Task());
-    }
+    model_state_.task = obj_->Task();  // required by gbm configuration.
+    used.merge(this->ConfigureGBM(old_tparam, config_args));
 
-    this->ConfigureGBM(old_tparam, args);
-    generic_parameters_.ConfigureGpuId(this->gbm_->UseGPU());
-
-    this->ConfigureMetrics(args);
+    this->ConfigureModelState(old_tparam, args);
+    used.merge(this->ConfigureMetrics(config_args));
 
     this->need_configuration_ = false;
-    if (generic_parameters_.validate_parameters) {
-      this->ValidateParameters();
+    if (ctx_.validate_parameters) {
+      this->ValidateParameters(args, used);
     }
 
-    // FIXME(trivialfis): Clear the cache once binary IO is gone.
     monitor_.Stop("Configure");
   }
 
-  virtual PredictionContainer* GetPredictionCache() const {
-    return &((*ThreadLocalPredictionCache::Get())[this]);
-  }
-
-  void LoadConfig(Json const& in) override {
+ protected:
+  void LoadConfigImpl(Json const& in) {
+    // If configuration is loaded, ensure that the model came from the same version
     CHECK(IsA<Object>(in));
-    Version::Load(in);
+    auto origin_version = Version::Load(in);
+    if (std::get<0>(Version::kInvalid) == std::get<0>(origin_version)) {
+      LOG(WARNING) << "Invalid version string in config";
+    }
+
+    if (!Version::Same(origin_version)) {
+      error::WarnOldSerialization();
+      return;  // skip configuration if version is not matched
+    }
 
     auto const& learner_parameters = get<Object>(in["learner"]);
     FromJson(learner_parameters.at("learner_train_param"), &tparam_);
@@ -371,14 +609,15 @@ class LearnerConfiguration : public Learner {
 
     auto const& objective_fn = learner_parameters.at("objective");
     if (!obj_) {
-      obj_.reset(ObjFunction::Create(tparam_.objective, &generic_parameters_));
+      CHECK_EQ(get<String const>(objective_fn["name"]), tparam_.objective);
+      obj_.reset(ObjFunction::Create(tparam_.objective, &ctx_));
     }
     obj_->LoadConfig(objective_fn);
+    model_state_.task = obj_->Task();
 
-    tparam_.booster = get<String>(gradient_booster["name"]);
+    tparam_.booster = CanonicalizeBoosterName(get<String>(gradient_booster["name"]));
     if (!gbm_) {
-      gbm_.reset(GradientBooster::Create(tparam_.booster,
-                                         &generic_parameters_, &learner_model_param_));
+      gbm_.reset(GradientBooster::Create(tparam_.booster, &ctx_, &model_state_));
     }
     gbm_->LoadConfig(gradient_booster);
 
@@ -387,28 +626,40 @@ class LearnerConfiguration : public Learner {
     metric_names_.resize(n_metrics);
     metrics_.resize(n_metrics);
     for (size_t i = 0; i < n_metrics; ++i) {
-      metric_names_[i]= get<String>(j_metrics[i]);
-      metrics_[i] = std::unique_ptr<Metric>(
-          Metric::Create(metric_names_[i], &generic_parameters_));
+      auto old_serialization = IsA<String>(j_metrics[i]);
+      if (old_serialization) {
+        error::WarnOldSerialization();
+        metric_names_[i] = get<String>(j_metrics[i]);
+      } else {
+        metric_names_[i] = get<String>(j_metrics[i]["name"]);
+      }
+      metrics_[i] = std::unique_ptr<Metric>(Metric::Create(metric_names_[i], &ctx_));
+      if (!old_serialization) {
+        metrics_[i]->LoadConfig(j_metrics[i]);
+      }
     }
 
-    FromJson(learner_parameters.at("generic_param"), &generic_parameters_);
-    // make sure the GPU ID is valid in new environment before start running configure.
-    generic_parameters_.ConfigureGpuId(false);
+    ctx_.FromJson(learner_parameters.at("generic_param"));
 
     this->need_configuration_ = true;
+  }
+
+ public:
+  void LoadConfig(Json const& in) override {
+    this->LoadConfigImpl(in);
+    this->Configure();
   }
 
   void SaveConfig(Json* p_out) const override {
     CHECK(!this->need_configuration_) << "Call Configure before saving model.";
     Version::Save(p_out);
-    Json& out { *p_out };
+    Json& out{*p_out};
     // parameters
     out["learner"] = Object();
     auto& learner_parameters = out["learner"];
 
     learner_parameters["learner_train_param"] = ToJson(tparam_);
-    learner_parameters["learner_model_param"] = mparam_.ToJson();
+    learner_parameters["learner_model_param"] = this->SaveModelState();
     learner_parameters["gradient_booster"] = Object();
     auto& gradient_booster = learner_parameters["gradient_booster"];
     gbm_->SaveConfig(&gradient_booster);
@@ -419,38 +670,18 @@ class LearnerConfiguration : public Learner {
 
     std::vector<Json> metrics(metrics_.size());
     for (size_t i = 0; i < metrics_.size(); ++i) {
-      metrics[i] = String(metrics_[i]->Name());
+      metrics[i] = Object{};
+      metrics_[i]->SaveConfig(&metrics[i]);
     }
     learner_parameters["metrics"] = Array(std::move(metrics));
 
-    learner_parameters["generic_param"] = ToJson(generic_parameters_);
+    learner_parameters["generic_param"] = ctx_.ToJson();
   }
 
-  void SetParam(const std::string& key, const std::string& value) override {
-    this->need_configuration_ = true;
-    if (key == kEvalMetric) {
-      if (std::find(metric_names_.cbegin(), metric_names_.cend(),
-                    value) == metric_names_.cend()) {
-        metric_names_.emplace_back(value);
-      }
-    } else {
-      cfg_[key] = value;
-    }
-  }
-  // Short hand for setting multiple parameters
-  void SetParams(std::vector<std::pair<std::string, std::string>> const& args) override {
-    for (auto const& kv : args) {
-      this->SetParam(kv.first, kv.second);
-    }
-  }
-
-  uint32_t GetNumFeature() const override {
-    return learner_model_param_.num_feature;
-  }
+  uint32_t GetNumFeature() const override { return model_state_.num_feature; }
 
   void SetAttr(const std::string& key, const std::string& value) override {
     attributes_[key] = value;
-    mparam_.contain_extra_attrs = 1;
   }
 
   bool GetAttr(const std::string& key, std::string* out) const override {
@@ -462,26 +693,26 @@ class LearnerConfiguration : public Learner {
 
   bool DelAttr(const std::string& key) override {
     auto it = attributes_.find(key);
-    if (it == attributes_.end()) { return false; }
+    if (it == attributes_.end()) {
+      return false;
+    }
     attributes_.erase(it);
     return true;
   }
 
-  void SetFeatureNames(std::vector<std::string> const& fn) override {
-    feature_names_ = fn;
-  }
+  void SetFeatureNames(std::vector<std::string> const& fn) override { feature_names_ = fn; }
 
-  void GetFeatureNames(std::vector<std::string>* fn) const override {
-    *fn = feature_names_;
-  }
+  void GetFeatureNames(std::vector<std::string>* fn) const override { *fn = feature_names_; }
 
-  void SetFeatureTypes(std::vector<std::string> const& ft) override {
-    this->feature_types_ = ft;
-  }
+  void SetFeatureTypes(std::vector<std::string> const& ft) override { this->feature_types_ = ft; }
 
   void GetFeatureTypes(std::vector<std::string>* p_ft) const override {
     auto& ft = *p_ft;
     ft = this->feature_types_;
+  }
+  [[nodiscard]] CatContainer const* Cats() const override {
+    this->CheckModelInitialized();
+    return this->gbm_->Cats();
   }
 
   std::vector<std::string> GetAttrNames() const override {
@@ -492,199 +723,131 @@ class LearnerConfiguration : public Learner {
     return out;
   }
 
-  const std::map<std::string, std::string>& GetConfigurationArguments() const override {
-    return cfg_;
-  }
-
-  GenericParameter const& GetGenericParameter() const override {
-    return generic_parameters_;
-  }
+  Context const* Ctx() const override { return &ctx_; }
 
  private:
-  void ValidateParameters() {
-    Json config { Object() };
-    this->SaveConfig(&config);
-    std::stack<Json> stack;
-    stack.push(config);
-    std::string const postfix{"_param"};
-
-    auto is_parameter = [&postfix](std::string const &key) {
-      return key.size() > postfix.size() &&
-             std::equal(postfix.rbegin(), postfix.rend(), key.rbegin());
-    };
-
-    // Extract all parameters
-    std::vector<std::string> keys;
-    // First global parameters
-    Json const global_config{ToJson(*GlobalConfigThreadLocalStore::Get())};
-    for (auto const& items : get<Object const>(global_config)) {
-      keys.emplace_back(items.first);
-    }
-    // Parameters in various xgboost components.
-    while (!stack.empty()) {
-      auto j_obj = stack.top();
-      stack.pop();
-      auto const &obj = get<Object const>(j_obj);
-
-      for (auto const &kv : obj) {
-        if (is_parameter(kv.first)) {
-          auto parameter = get<Object const>(kv.second);
-          std::transform(parameter.begin(), parameter.end(), std::back_inserter(keys),
-                         [](std::pair<std::string const&, Json const&> const& kv) {
-                           return kv.first;
-                         });
-        } else if (IsA<Object>(kv.second)) {
-          stack.push(kv.second);
-        }
-      }
-    }
-
-    // FIXME(trivialfis): Make eval_metric a training parameter.
-    keys.emplace_back(kEvalMetric);
-    keys.emplace_back("num_output_group");
-
-    std::sort(keys.begin(), keys.end());
-
-    std::vector<std::string> provided;
-    for (auto const &kv : cfg_) {
+  void ValidateParameters(Args const& args, std::set<std::string> const& used) {
+    std::set<std::string> provided;
+    for (auto const& kv : args) {
       if (std::any_of(kv.first.cbegin(), kv.first.cend(),
                       [](char ch) { return std::isspace(ch); })) {
         LOG(FATAL) << "Invalid parameter \"" << kv.first << "\" contains whitespace.";
       }
-      provided.push_back(kv.first);
+      provided.insert(kv.first);
     }
-    std::sort(provided.begin(), provided.end());
 
     std::vector<std::string> diff;
-    std::set_difference(provided.begin(), provided.end(), keys.begin(),
-                        keys.end(), std::back_inserter(diff));
-    if (diff.size() != 0) {
+    std::set_difference(provided.begin(), provided.end(), used.begin(), used.end(),
+                        std::back_inserter(diff));
+    if (!diff.empty()) {
       std::stringstream ss;
       ss << "\nParameters: { ";
       for (size_t i = 0; i < diff.size() - 1; ++i) {
         ss << "\"" << diff[i] << "\", ";
       }
       ss << "\"" << diff.back() << "\"";
-      ss << R"W( } might not be used.
-
-  This could be a false alarm, with some parameters getting used by language bindings but
-  then being mistakenly passed down to XGBoost core, or some parameter actually being used
-  but getting flagged wrongly here. Please open an issue if you find any such cases.
-
+      ss << R"W( } are not used.
 )W";
       LOG(WARNING) << ss.str();
     }
   }
 
-  void ConfigureNumFeatures() {
-    // Compute number of global features if parameter not already set
-    if (mparam_.num_feature == 0) {
-      // TODO(hcho3): Change num_feature to 64-bit integer
-      unsigned num_feature = 0;
-      auto local_cache = this->GetPredictionCache();
-      for (auto& matrix : local_cache->Container()) {
-        CHECK(matrix.first);
-        CHECK(!matrix.second.ref.expired());
-        const uint64_t num_col = matrix.first->Info().num_col_;
-        CHECK_LE(num_col,
-                 static_cast<uint64_t>(std::numeric_limits<unsigned>::max()))
-            << "Unfortunately, XGBoost does not support data matrices with "
-            << std::numeric_limits<unsigned>::max() << " features or greater";
-        num_feature = std::max(num_feature, static_cast<uint32_t>(num_col));
-      }
-
-      rabit::Allreduce<rabit::op::Max>(&num_feature, 1);
-      if (num_feature > mparam_.num_feature) {
-        mparam_.num_feature = num_feature;
-      }
+  std::set<std::string> ConfigureGBM(LearnerTrainParam const& old, Args const& args) {
+    tparam_.booster = CanonicalizeBoosterName(tparam_.booster);
+    if (tparam_.booster == "gblinear") {
+      LOG(WARNING) << "`booster=gblinear` is deprecated and support will be removed in a future "
+                      "release.";
     }
-    CHECK_NE(mparam_.num_feature, 0)
-        << "0 feature is supplied.  Are you using raw Booster interface?";
-    // Remove these once binary IO is gone.
-    cfg_["num_feature"] = common::ToString(mparam_.num_feature);
-    cfg_["num_class"] = common::ToString(mparam_.num_class);
+    auto old_booster = CanonicalizeBoosterName(old.booster);
+    if (gbm_ == nullptr || old_booster != tparam_.booster) {
+      gbm_.reset(GradientBooster::Create(tparam_.booster, &ctx_, &model_state_));
+    }
+    return gbm_->Configure(args);
   }
 
-  void ConfigureGBM(LearnerTrainParam const& old, Args const& args) {
-    if (gbm_ == nullptr || old.booster != tparam_.booster) {
-      gbm_.reset(GradientBooster::Create(tparam_.booster, &generic_parameters_,
-                                         &learner_model_param_));
-    }
-    gbm_->Configure(args);
-  }
-
-  void ConfigureObjective(LearnerTrainParam const& old, Args* p_args) {
+  std::set<std::string> ConfigureObjective(LearnerTrainParam const& old,
+                                           std::map<std::string, std::string>* p_config,
+                                           Args* p_args) {
+    auto& config = *p_config;
     // Once binary IO is gone, NONE of these config is useful.
-    if (cfg_.find("num_class") != cfg_.cend() && cfg_.at("num_class") != "0" &&
+    if (config.find("num_class") != config.cend() && config.at("num_class") != "0" &&
         tparam_.objective != "multi:softprob") {
-      cfg_["num_output_group"] = cfg_["num_class"];
-      if (atoi(cfg_["num_class"].c_str()) > 1 && cfg_.count("objective") == 0) {
+      config["num_output_group"] = config["num_class"];
+      if (atoi(config["num_class"].c_str()) > 1 && config.count("objective") == 0) {
         tparam_.objective = "multi:softmax";
       }
     }
 
-    if (cfg_.find("max_delta_step") == cfg_.cend() &&
-        cfg_.find("objective") != cfg_.cend() &&
-        tparam_.objective == "count:poisson") {
-      // max_delta_step is a duplicated parameter in Poisson regression and tree param.
-      // Rename one of them once binary IO is gone.
-      cfg_["max_delta_step"] = kMaxDeltaStepDefaultValue;
-    }
     if (obj_ == nullptr || tparam_.objective != old.objective) {
-      obj_.reset(ObjFunction::Create(tparam_.objective, &generic_parameters_));
+      obj_.reset(ObjFunction::Create(tparam_.objective, &ctx_));
     }
+
+    bool has_nc{config.find("num_class") != config.cend()};
+    // Inject num_class into configuration.
+    // FIXME(jiamingy): Remove the duplicated parameter in softmax
+    config["num_class"] = std::to_string(tparam_.num_class);
     auto& args = *p_args;
-    args = {cfg_.cbegin(), cfg_.cend()};  // renew
-    obj_->Configure(args);
+    args = {config.cbegin(), config.cend()};
+    auto used = obj_->Configure(args);
+    if (!has_nc) {
+      config.erase("num_class");
+    }
+    return used;
   }
 
-  void ConfigureMetrics(Args const& args) {
+  std::set<std::string> ConfigureMetrics(Args const& args) {
+    std::set<std::string> used;
     for (auto const& name : metric_names_) {
       auto DupCheck = [&name](std::unique_ptr<Metric> const& m) {
-                        return m->Name() != name;
-                      };
+        return m->Name() != name;
+      };
       if (std::all_of(metrics_.begin(), metrics_.end(), DupCheck)) {
-        metrics_.emplace_back(std::unique_ptr<Metric>(Metric::Create(name, &generic_parameters_)));
-        mparam_.contain_eval_metrics = 1;
+        metrics_.emplace_back(std::unique_ptr<Metric>(Metric::Create(name, &ctx_)));
       }
     }
+
     for (auto& p_metric : metrics_) {
-      p_metric->Configure(args);
+      used.merge(p_metric->Configure(args));
     }
+    return used;
   }
 };
 
-std::string const LearnerConfiguration::kEvalMetric {"eval_metric"};  // NOLINT
+std::string const LearnerConfiguration::kEvalMetric{"eval_metric"};  // NOLINT
 
 class LearnerIO : public LearnerConfiguration {
- private:
-  std::set<std::string> saved_configs_ = {"num_round"};
-  // Used to identify the offset of JSON string when
-  // Will be removed once JSON takes over.  Right now we still loads some RDS files from R.
-  std::string const serialisation_header_ { u8"CONFIG-offset:" };
+ protected:
+  void ClearCaches() { this->cache_data_.clear(); }
 
  public:
-  explicit LearnerIO(std::vector<std::shared_ptr<DMatrix> > cache) :
-      LearnerConfiguration{cache} {}
+  explicit LearnerIO(std::vector<std::shared_ptr<DMatrix>> cache) : LearnerConfiguration{cache} {}
 
-  void LoadModel(Json const& in) override {
+ protected:
+  void LoadModelImpl(Json const& in) {
     CHECK(IsA<Object>(in));
-    Version::Load(in);
+    model_state_ = LearnerModelState{};
+    auto version = Version::Load(in);
+    if (std::get<0>(version) == 1 && std::get<1>(version) < 6) {
+      LOG(WARNING)
+          << "Found JSON model saved before XGBoost 1.6, please save the model using current "
+             "version again. The support for old JSON model will be discontinued in XGBoost 3.2";
+    }
+
     auto const& learner = get<Object>(in["learner"]);
-    mparam_.FromJson(learner.at("learner_model_param"));
 
     auto const& objective_fn = learner.at("objective");
 
     std::string name = get<String>(objective_fn["name"]);
     tparam_.UpdateAllowUnknown(Args{{"objective", name}});
-    obj_.reset(ObjFunction::Create(name, &generic_parameters_));
+    obj_.reset(ObjFunction::Create(name, &ctx_));
     obj_->LoadConfig(objective_fn);
 
+    this->LoadModelState(learner.at("learner_model_param"));
     auto const& gradient_booster = learner.at("gradient_booster");
     name = get<String>(gradient_booster["name"]);
     tparam_.UpdateAllowUnknown(Args{{"booster", name}});
-    gbm_.reset(GradientBooster::Create(tparam_.booster,
-                                       &generic_parameters_, &learner_model_param_));
+    tparam_.booster = CanonicalizeBoosterName(tparam_.booster);
+    gbm_.reset(GradientBooster::Create(tparam_.booster, &ctx_, &model_state_));
     gbm_->LoadModel(gradient_booster);
 
     auto const& j_attributes = get<Object const>(learner.at("attributes"));
@@ -696,35 +859,38 @@ class LearnerIO : public LearnerConfiguration {
     // feature names and types are saved in xgboost 1.4
     auto it = learner.find("feature_names");
     if (it != learner.cend()) {
-      auto const &feature_names = get<Array const>(it->second);
-      feature_names_.clear();
-      for (auto const &name : feature_names) {
-        feature_names_.emplace_back(get<String const>(name));
-      }
+      auto const& feature_names = get<Array const>(it->second);
+      feature_names_.resize(feature_names.size());
+      std::transform(feature_names.cbegin(), feature_names.cend(), feature_names_.begin(),
+                     [](Json const& fn) { return get<String const>(fn); });
     }
     it = learner.find("feature_types");
     if (it != learner.cend()) {
-      auto const &feature_types = get<Array const>(it->second);
-      feature_types_.clear();
-      for (auto const &name : feature_types) {
-        auto type = get<String const>(name);
-        feature_types_.emplace_back(type);
-      }
+      auto const& feature_types = get<Array const>(it->second);
+      feature_types_.resize(feature_types.size());
+      std::transform(feature_types.cbegin(), feature_types.cend(), feature_types_.begin(),
+                     [](Json const& fn) { return get<String const>(fn); });
     }
 
     this->need_configuration_ = true;
+    this->ClearCaches();
   }
 
-  void SaveModel(Json* p_out) const override {
-    CHECK(!this->need_configuration_) << "Call Configure before saving model.";
+ public:
+  void LoadModel(Json const& in) override {
+    this->LoadModelImpl(in);
+    this->Configure();
+  }
 
+ private:
+  void SaveModelUnchecked(Json* p_out) const {
     Version::Save(p_out);
-    Json& out { *p_out };
+    Json& out{*p_out};
 
     out["learner"] = Object();
     auto& learner = out["learner"];
 
-    learner["learner_model_param"] = mparam_.ToJson();
+    learner["learner_model_param"] = this->SaveModelState();
     learner["gradient_booster"] = Object();
     auto& gradient_booster = learner["gradient_booster"];
     gbm_->SaveModel(&gradient_booster);
@@ -749,242 +915,53 @@ class LearnerIO : public LearnerConfiguration {
       feature_types.emplace_back(type);
     }
   }
-  // About to be deprecated by JSON format
-  void LoadModel(dmlc::Stream* fi) override {
-    generic_parameters_.UpdateAllowUnknown(Args{});
-    tparam_.Init(std::vector<std::pair<std::string, std::string>>{});
-    // TODO(tqchen) mark deprecation of old format.
-    common::PeekableInStream fp(fi);
 
-    // backward compatible header check.
-    std::string header;
-    header.resize(4);
-    if (fp.PeekRead(&header[0], 4) == 4) {
-      CHECK_NE(header, "bs64")
-          << "Base64 format is no longer supported in brick.";
-      if (header == "binf") {
-        CHECK_EQ(fp.Read(&header[0], 4), 4U);
-      }
-    }
-
-    if (header[0] == '{') {
-      // Dispatch to JSON
-      auto json_stream = common::FixedSizeStream(&fp);
-      std::string buffer;
-      json_stream.Take(&buffer);
-      auto model = Json::Load({buffer.c_str(), buffer.size()});
-      this->LoadModel(model);
-      return;
-    }
-    // use the peekable reader.
-    fi = &fp;
-    // read parameter
-    CHECK_EQ(fi->Read(&mparam_, sizeof(mparam_)), sizeof(mparam_))
-        << "BoostLearner: wrong model format";
-    if (!DMLC_IO_NO_ENDIAN_SWAP) {
-      mparam_ = mparam_.ByteSwap();
-    }
-    CHECK(fi->Read(&tparam_.objective)) << "BoostLearner: wrong model format";
-    CHECK(fi->Read(&tparam_.booster)) << "BoostLearner: wrong model format";
-
-    obj_.reset(ObjFunction::Create(tparam_.objective, &generic_parameters_));
-    gbm_.reset(GradientBooster::Create(tparam_.booster, &generic_parameters_,
-                                       &learner_model_param_));
-    gbm_->Load(fi);
-    if (mparam_.contain_extra_attrs != 0) {
-      std::vector<std::pair<std::string, std::string> > attr;
-      fi->Read(&attr);
-      for (auto& kv : attr) {
-        const std::string prefix = "SAVED_PARAM_";
-        if (kv.first.find(prefix) == 0) {
-          const std::string saved_param = kv.first.substr(prefix.length());
-          if (saved_configs_.find(saved_param) != saved_configs_.end()) {
-            cfg_[saved_param] = kv.second;
-          }
-        }
-      }
-      attributes_ = std::map<std::string, std::string>(attr.begin(), attr.end());
-    }
-    bool warn_old_model { false };
-    if (attributes_.find("count_poisson_max_delta_step") != attributes_.cend()) {
-      // Loading model from < 1.0.0, objective is not saved.
-      cfg_["max_delta_step"] = attributes_.at("count_poisson_max_delta_step");
-      attributes_.erase("count_poisson_max_delta_step");
-      warn_old_model = true;
-    } else {
-      warn_old_model = false;
-    }
-
-    if (mparam_.major_version < 1) {
-      // Before 1.0.0, base_score is saved as a transformed value, and there's no version
-      // attribute (saved a 0) in the saved model.
-      std::string multi{"multi:"};
-      if (!std::equal(multi.cbegin(), multi.cend(), tparam_.objective.cbegin())) {
-        HostDeviceVector<float> t;
-        t.HostVector().resize(1);
-        t.HostVector().at(0) = mparam_.base_score;
-        this->obj_->PredTransform(&t);
-        auto base_score = t.HostVector().at(0);
-        mparam_.base_score = base_score;
-      }
-      warn_old_model = true;
-    }
-
-    learner_model_param_ =
-        LearnerModelParam(mparam_, obj_->ProbToMargin(mparam_.base_score), obj_->Task());
-    if (attributes_.find("objective") != attributes_.cend()) {
-      auto obj_str = attributes_.at("objective");
-      auto j_obj = Json::Load({obj_str.c_str(), obj_str.size()});
-      obj_->LoadConfig(j_obj);
-      attributes_.erase("objective");
-    } else {
-      warn_old_model = true;
-    }
-    if (attributes_.find("metrics") != attributes_.cend()) {
-      auto metrics_str = attributes_.at("metrics");
-      std::vector<std::string> names { common::Split(metrics_str, ';') };
-      attributes_.erase("metrics");
-      for (auto const& n : names) {
-        this->SetParam(kEvalMetric, n);
-      }
-    }
-
-    if (warn_old_model) {
-      LOG(WARNING) << "Loading model from XGBoost < 1.0.0, consider saving it "
-                      "again for improved compatibility";
-    }
-
-    // Renew the version.
-    mparam_.major_version = std::get<0>(Version::Self());
-    mparam_.minor_version = std::get<1>(Version::Self());
-
-    cfg_["num_class"] = common::ToString(mparam_.num_class);
-    cfg_["num_feature"] = common::ToString(mparam_.num_feature);
-
-    auto n = tparam_.__DICT__();
-    cfg_.insert(n.cbegin(), n.cend());
-
-    // copy dsplit from config since it will not run again during restore
-    if (tparam_.dsplit == DataSplitMode::kAuto && rabit::IsDistributed()) {
-      tparam_.dsplit = DataSplitMode::kRow;
-    }
-
-    this->need_configuration_ = true;
-  }
-
-  // Save model into binary format.  The code is about to be deprecated by more robust
-  // JSON serialization format.
-  void SaveModel(dmlc::Stream* fo) const override {
-    LearnerModelParamLegacy mparam = mparam_;  // make a copy to potentially modify
-    std::vector<std::pair<std::string, std::string> > extra_attr;
-    mparam.contain_extra_attrs = 1;
-
-    {
-      std::vector<std::string> saved_params;
-      for (const auto& key : saved_params) {
-        auto it = cfg_.find(key);
-        if (it != cfg_.end()) {
-          mparam.contain_extra_attrs = 1;
-          extra_attr.emplace_back("SAVED_PARAM_" + key, it->second);
-        }
-      }
-    }
-    {
-      // Similar to JSON model IO, we save the objective.
-      Json j_obj { Object() };
-      obj_->SaveConfig(&j_obj);
-      std::string obj_doc;
-      Json::Dump(j_obj, &obj_doc);
-      extra_attr.emplace_back("objective", obj_doc);
-    }
-    // As of 1.0.0, JVM Package and R Package uses Save/Load model for serialization.
-    // Remove this part once they are ported to use actual serialization methods.
-    if (mparam.contain_eval_metrics != 0) {
-      std::stringstream os;
-      for (auto& ev : metrics_) {
-        os << ev->Name() << ";";
-      }
-      extra_attr.emplace_back("metrics", os.str());
-    }
-    std::string header {"binf"};
-    fo->Write(header.data(), 4);
-    if (DMLC_IO_NO_ENDIAN_SWAP) {
-      fo->Write(&mparam, sizeof(LearnerModelParamLegacy));
-    } else {
-      LearnerModelParamLegacy x = mparam.ByteSwap();
-      fo->Write(&x, sizeof(LearnerModelParamLegacy));
-    }
-    fo->Write(tparam_.objective);
-    fo->Write(tparam_.booster);
-    gbm_->Save(fo);
-    if (mparam.contain_extra_attrs != 0) {
-      std::map<std::string, std::string> attr(attributes_);
-      for (const auto& kv : extra_attr) {
-        attr[kv.first] = kv.second;
-      }
-      fo->Write(std::vector<std::pair<std::string, std::string>>(
-          attr.begin(), attr.end()));
-    }
+ public:
+  void SaveModel(Json* p_out) const override {
+    CHECK(!this->need_configuration_) << "Call Configure before saving model.";
+    this->CheckModelInitialized();
+    this->SaveModelUnchecked(p_out);
   }
 
   void Save(dmlc::Stream* fo) const override {
+    CHECK(!this->need_configuration_) << "Call Configure before saving model.";
     Json memory_snapshot{Object()};
     memory_snapshot["Model"] = Object();
-    auto &model = memory_snapshot["Model"];
-    this->SaveModel(&model);
+    auto& model = memory_snapshot["Model"];
+    // A memory snapshot preserves pending parameters and metadata for an uninitialized
+    // learner. Unlike a model file, it does not require a fitted model.
+    this->SaveModelUnchecked(&model);
     memory_snapshot["Config"] = Object();
-    auto &config = memory_snapshot["Config"];
+    auto& config = memory_snapshot["Config"];
     this->SaveConfig(&config);
-    std::string out_str;
-    Json::Dump(memory_snapshot, &out_str);
-    fo->Write(out_str.c_str(), out_str.size());
+
+    std::vector<char> stream;
+    Json::Dump(memory_snapshot, &stream, std::ios::binary);
+    fo->Write(stream.data(), stream.size());
   }
 
   void Load(dmlc::Stream* fi) override {
     common::PeekableInStream fp(fi);
-    char c {0};
-    fp.PeekRead(&c, 1);
-    if (c == '{') {
-      std::string buffer;
-      common::FixedSizeStream{&fp}.Take(&buffer);
-      auto memory_snapshot = Json::Load({buffer.c_str(), buffer.size()});
-      this->LoadModel(memory_snapshot["Model"]);
-      this->LoadConfig(memory_snapshot["Config"]);
+    char header[2];
+    fp.PeekRead(header, 2);
+    StringView msg = "Invalid serialization file.";
+    CHECK_EQ(header[0], '{') << msg;
+
+    auto buffer = common::ReadAll(fi, &fp);
+    Json memory_snapshot;
+    CHECK(std::isalpha(header[1])) << msg;
+    if (header[1] == '"') {
+      memory_snapshot = Json::Load(StringView{buffer});
+      error::WarnOldSerialization();
+    } else if (std::isalpha(header[1])) {
+      memory_snapshot = Json::Load(StringView{buffer}, std::ios::binary);
     } else {
-      std::string header;
-      header.resize(serialisation_header_.size());
-      CHECK_EQ(fp.Read(&header[0], header.size()), serialisation_header_.size());
-      // Avoid printing the content in loaded header, which might be random binary code.
-      CHECK(header == serialisation_header_)  // NOLINT
-          << R"doc(
-
-  If you are loading a serialized model (like pickle in Python) generated by older
-  XGBoost, please export the model by calling `Booster.save_model` from that version
-  first, then load it back in current version.  There's a simple script for helping
-  the process. See:
-
-    https://xgboost.readthedocs.io/en/latest/tutorials/saving_model.html
-
-  for reference to the script, and more details about differences between saving model and
-  serializing.
-
-)doc";
-      int64_t sz {-1};
-      CHECK_EQ(fp.Read(&sz, sizeof(sz)), sizeof(sz));
-      if (!DMLC_IO_NO_ENDIAN_SWAP) {
-        dmlc::ByteSwap(&sz, sizeof(sz), 1);
-      }
-      CHECK_GT(sz, 0);
-      size_t json_offset = static_cast<size_t>(sz);
-      std::string buffer;
-      common::FixedSizeStream{&fp}.Take(&buffer);
-
-      common::MemoryFixSizeBuffer binary_buf(&buffer[0], json_offset);
-      this->LoadModel(&binary_buf);
-
-      auto config = Json::Load({buffer.c_str() + json_offset, buffer.size() - json_offset});
-      this->LoadConfig(config);
+      LOG(FATAL) << "Invalid serialization file.";
     }
+
+    this->LoadModelImpl(memory_snapshot["Model"]);
+    this->LoadConfigImpl(memory_snapshot["Config"]);
+    this->Configure();
   }
 };
 
@@ -994,56 +971,47 @@ class LearnerIO : public LearnerConfiguration {
  */
 class LearnerImpl : public LearnerIO {
  public:
-  explicit LearnerImpl(std::vector<std::shared_ptr<DMatrix> > cache)
-      : LearnerIO{cache} {}
+  explicit LearnerImpl(std::vector<std::shared_ptr<DMatrix>> cache) : LearnerIO{cache} {}
   ~LearnerImpl() override {
     auto local_map = LearnerAPIThreadLocalStore::Get();
     if (local_map->find(this) != local_map->cend()) {
       local_map->erase(this);
     }
   }
-  // Configuration before data is known.
-  void CheckDataSplitMode() {
-    if (rabit::IsDistributed()) {
-      CHECK(tparam_.dsplit != DataSplitMode::kAuto)
-        << "Precondition violated; dsplit cannot be 'auto' in distributed mode";
-      if (tparam_.dsplit == DataSplitMode::kCol) {
-        LOG(FATAL) << "Column-wise data split is currently not supported.";
-      }
-    }
-  }
 
-  std::vector<std::string> DumpModel(const FeatureMap& fmap,
-                                     bool with_stats,
+  std::vector<std::string> DumpModel(const FeatureMap& fmap, bool with_stats,
                                      std::string format) override {
     this->Configure();
+    this->CheckModelInitialized();
+
     return gbm_->DumpModel(fmap, with_stats, format);
   }
 
-  Learner *Slice(int32_t begin_layer, int32_t end_layer, int32_t step,
-                 bool *out_of_bound) override {
+  Learner* Slice(bst_layer_t begin, bst_layer_t end, bst_layer_t step,
+                 bool* out_of_bound) override {
     this->Configure();
-    CHECK_NE(this->learner_model_param_.num_feature, 0);
-    CHECK_GE(begin_layer, 0);
-    auto *out_impl = new LearnerImpl({});
-    out_impl->learner_model_param_ = this->learner_model_param_;
-    out_impl->generic_parameters_ = this->generic_parameters_;
-    auto gbm = std::unique_ptr<GradientBooster>(GradientBooster::Create(
-        this->tparam_.booster, &out_impl->generic_parameters_,
-        &out_impl->learner_model_param_));
-    this->gbm_->Slice(begin_layer, end_layer, step, gbm.get(), out_of_bound);
+    this->CheckModelInitialized();
+
+    CHECK_NE(this->model_state_.num_feature, 0);
+    CHECK_GE(begin, 0);
+    auto* out_impl = new LearnerImpl({});
+    out_impl->model_state_.Copy(this->model_state_);
+    out_impl->tparam_ = this->tparam_;
+    out_impl->ctx_ = this->ctx_;
+    auto gbm = std::unique_ptr<GradientBooster>(
+        GradientBooster::Create(this->tparam_.booster, &out_impl->ctx_, &out_impl->model_state_));
+    this->gbm_->Slice(begin, end, step, gbm.get(), out_of_bound);
     out_impl->gbm_ = std::move(gbm);
 
-    Json config { Object() };
+    Json config{Object()};
     this->SaveConfig(&config);
-    out_impl->mparam_ = this->mparam_;
     out_impl->attributes_ = this->attributes_;
     out_impl->SetFeatureNames(this->feature_names_);
     out_impl->SetFeatureTypes(this->feature_types_);
     out_impl->LoadConfig(config);
     out_impl->Configure();
-    CHECK_EQ(out_impl->learner_model_param_.num_feature, this->learner_model_param_.num_feature);
-    CHECK_NE(out_impl->learner_model_param_.num_feature, 0);
+    CHECK_EQ(out_impl->model_state_.num_feature, this->model_state_.num_feature);
+    CHECK_NE(out_impl->model_state_.num_feature, 0);
 
     auto erase_attr = [&](std::string attr) {
       // Erase invalid attributes.
@@ -1057,90 +1025,117 @@ class LearnerImpl : public LearnerIO {
     return out_impl;
   }
 
+  void Reset() override {
+    this->Configure();
+    if (model_state_.NeedsInitialization()) {
+      for (auto const& weak : cache_data_) {
+        if (auto data = weak.lock()) {
+          this->InitializeModel(data.get(), this->cache_data_,
+                                InterceptInitialization::kEstimateIntercept);
+          break;
+        }
+      }
+    }
+    this->CheckModelInitialized();
+    // Global data
+    auto local_map = LearnerAPIThreadLocalStore::Get();
+    if (local_map->find(this) != local_map->cend()) {
+      local_map->erase(this);
+    }
+
+    // Model
+    std::string buf;
+    common::MemoryBufferStream fo(&buf);
+    this->Save(&fo);
+
+    common::MemoryFixSizeBuffer fs(buf.data(), buf.size());
+    this->Load(&fs);
+
+    // Learner self cache. Prediction is cleared in the load method
+    CHECK(this->cache_data_.empty());
+    this->gpair_ = decltype(this->gpair_){};
+  }
+
   void UpdateOneIter(int iter, std::shared_ptr<DMatrix> train) override {
     monitor_.Start("UpdateOneIter");
     TrainingObserver::Instance().Update(iter);
     this->Configure();
-    if (generic_parameters_.seed_per_iteration) {
-      common::GlobalRandom().seed(generic_parameters_.seed * kRandSeedMagic + iter);
+    this->InitializeModel(train.get(), this->cache_data_,
+                          InterceptInitialization::kEstimateIntercept);
+
+    if (ctx_.seed_per_iteration) {
+      ctx_.Rng().seed(ctx_.seed * kRandSeedMagic + this->BoostedRounds());
     }
 
-    this->CheckDataSplitMode();
     this->ValidateDMatrix(train.get(), true);
 
-    auto local_cache = this->GetPredictionCache();
-    auto& predt = local_cache->Cache(train, generic_parameters_.gpu_id);
+    HostDeviceVector<float> predt;
 
     monitor_.Start("PredictRaw");
-    this->PredictRaw(train.get(), &predt, true, 0, 0);
-    TrainingObserver::Instance().Observe(predt.predictions, "Predictions");
+    this->PredictRaw(train, &predt, true, 0, 0);
+    TrainingObserver::Instance().Observe(predt, "Predictions");
     monitor_.Stop("PredictRaw");
 
     monitor_.Start("GetGradient");
-    obj_->GetGradient(predt.predictions, train->Info(), iter, &gpair_);
+    GetGradient(predt, train->Info(), iter, &gpair_.gpair);
     monitor_.Stop("GetGradient");
-    TrainingObserver::Instance().Observe(gpair_, "Gradients");
+    TrainingObserver::Instance().Observe(gpair_.Grad()->Data(), "Gradients");
 
-    gbm_->DoBoost(train.get(), &gpair_, &predt);
+    gbm_->DoBoost(train, &gpair_, obj_.get());
     monitor_.Stop("UpdateOneIter");
   }
 
-  void BoostOneIter(int iter, std::shared_ptr<DMatrix> train,
-                    HostDeviceVector<GradientPair>* in_gpair) override {
-    monitor_.Start("BoostOneIter");
+  void BoostOneIter(std::int32_t, std::shared_ptr<DMatrix> train,
+                    GradientContainer* in_gpair) override {
+    this->monitor_.Start(__func__);
     this->Configure();
-    if (generic_parameters_.seed_per_iteration) {
-      common::GlobalRandom().seed(generic_parameters_.seed * kRandSeedMagic + iter);
+    this->InitializeModel(train.get(), this->cache_data_,
+                          InterceptInitialization::kUseDefaultIntercept);
+
+    if (ctx_.seed_per_iteration) {
+      ctx_.Rng().seed(ctx_.seed * kRandSeedMagic + this->BoostedRounds());
     }
 
-    this->CheckDataSplitMode();
     this->ValidateDMatrix(train.get(), true);
-    auto local_cache = this->GetPredictionCache();
-    local_cache->Cache(train, generic_parameters_.gpu_id);
-
-    gbm_->DoBoost(train.get(), in_gpair, &local_cache->Entry(train.get()));
-    monitor_.Stop("BoostOneIter");
+    if (in_gpair->HasValueGrad()) {
+      CHECK_EQ(this->model_state_.OutputLength(), in_gpair->NumTargets())
+          << "Value gradient should have the same number of targets as the overall model.";
+    } else {
+      CHECK_EQ(this->model_state_.OutputLength(), in_gpair->NumSplitTargets())
+          << "The number of columns in gradient should be equal to the number of "
+             "targets/classes in the model.";
+    }
+    this->gbm_->DoBoost(train, in_gpair, obj_.get());
+    this->monitor_.Stop(__func__);
   }
 
-  std::string EvalOneIter(int iter,
-                          const std::vector<std::shared_ptr<DMatrix>>& data_sets,
+  std::string EvalOneIter(int iter, const std::vector<std::shared_ptr<DMatrix>>& data_sets,
                           const std::vector<std::string>& data_names) override {
     monitor_.Start("EvalOneIter");
     this->Configure();
+    this->CheckModelInitialized();
 
     std::ostringstream os;
     os.precision(std::numeric_limits<double>::max_digits10);
     os << '[' << iter << ']' << std::setiosflags(std::ios::fixed);
-    if (metrics_.size() == 0 && tparam_.disable_default_eval_metric <= 0) {
-      auto warn_default_eval_metric = [](const std::string& objective, const std::string& before,
-                                         const std::string& after, const std::string& version) {
-        LOG(WARNING) << "Starting in XGBoost " << version << ", the default evaluation metric "
-                     << "used with the objective '" << objective << "' was changed from '"
-                     << before << "' to '" << after << "'. Explicitly set eval_metric if you'd "
-                     << "like to restore the old behavior.";
-      };
-      if (tparam_.objective == "binary:logitraw") {
-        warn_default_eval_metric(tparam_.objective, "auc", "logloss", "1.4.0");
+    if (metrics_.empty() && !tparam_.disable_default_eval_metric) {
+      metrics_.emplace_back(Metric::Create(obj_->DefaultEvalMetric(), &ctx_));
+      auto config = obj_->DefaultMetricConfig();
+      if (!IsA<Null>(config)) {
+        metrics_.back()->LoadConfig(config);
       }
-      metrics_.emplace_back(Metric::Create(obj_->DefaultEvalMetric(), &generic_parameters_));
-      metrics_.back()->Configure({cfg_.begin(), cfg_.end()});
+      metrics_.back()->Configure({});
     }
 
-    auto local_cache = this->GetPredictionCache();
     for (size_t i = 0; i < data_sets.size(); ++i) {
       std::shared_ptr<DMatrix> m = data_sets[i];
-      auto &predt = local_cache->Cache(m, generic_parameters_.gpu_id);
       this->ValidateDMatrix(m.get(), false);
-      this->PredictRaw(m.get(), &predt, false, 0, 0);
-
-      auto &out = output_predictions_.Cache(m, generic_parameters_.gpu_id).predictions;
-      out.Resize(predt.predictions.Size());
-      out.Copy(predt.predictions);
+      HostDeviceVector<float> out;
+      this->PredictRaw(m, &out, false, 0, 0);
 
       obj_->EvalTransform(&out);
       for (auto& ev : metrics_) {
-        os << '\t' << data_names[i] << '-' << ev->Name() << ':'
-           << ev->Eval(out, m->Info(), tparam_.dsplit == DataSplitMode::kRow);
+        os << '\t' << data_names[i] << '-' << ev->Name() << ':' << ev->Evaluate(out, m);
       }
     }
 
@@ -1149,30 +1144,31 @@ class LearnerImpl : public LearnerIO {
   }
 
   void Predict(std::shared_ptr<DMatrix> data, bool output_margin,
-               HostDeviceVector<bst_float> *out_preds, unsigned layer_begin,
-               unsigned layer_end, bool training,
-               bool pred_leaf, bool pred_contribs, bool approx_contribs,
-               bool pred_interactions) override {
-    int multiple_predictions = static_cast<int>(pred_leaf) +
-                               static_cast<int>(pred_interactions) +
+               HostDeviceVector<float>* out_preds, bst_layer_t layer_begin, bst_layer_t layer_end,
+               bool training, bool pred_leaf, bool pred_contribs, bool approx_contribs,
+               bool pred_interactions, bool strict_shape) override {
+    int multiple_predictions = static_cast<int>(pred_leaf) + static_cast<int>(pred_interactions) +
                                static_cast<int>(pred_contribs);
     this->Configure();
+    if (training) {
+      this->InitializeModel(data.get(), this->cache_data_,
+                            InterceptInitialization::kUseDefaultIntercept);
+    }
+    this->CheckModelInitialized();
+
     CHECK_LE(multiple_predictions, 1) << "Perform one kind of prediction at a time.";
     if (pred_contribs) {
+      this->ValidateDMatrix(data.get(), false);
       gbm_->PredictContribution(data.get(), out_preds, layer_begin, layer_end, approx_contribs);
     } else if (pred_interactions) {
+      this->ValidateDMatrix(data.get(), false);
       gbm_->PredictInteractionContributions(data.get(), out_preds, layer_begin, layer_end,
                                             approx_contribs);
     } else if (pred_leaf) {
-      gbm_->PredictLeaf(data.get(), out_preds, layer_begin, layer_end);
+      this->ValidateDMatrix(data.get(), false);
+      gbm_->PredictLeaf(data.get(), out_preds, layer_begin, layer_end, strict_shape);
     } else {
-      auto local_cache = this->GetPredictionCache();
-      auto& prediction = local_cache->Cache(data, generic_parameters_.gpu_id);
-      this->PredictRaw(data.get(), &prediction, training, layer_begin, layer_end);
-      // Copy the prediction cache to output prediction. out_preds comes from C API
-      out_preds->SetDevice(generic_parameters_.gpu_id);
-      out_preds->Resize(prediction.predictions.Size());
-      out_preds->Copy(prediction.predictions);
+      this->PredictRaw(data, out_preds, training, layer_begin, layer_end);
       if (!output_margin) {
         obj_->PredTransform(out_preds);
       }
@@ -1180,46 +1176,50 @@ class LearnerImpl : public LearnerIO {
   }
 
   int32_t BoostedRounds() const override {
-    if (!this->gbm_) { return 0; }  // haven't call train or LoadModel.
+    if (!this->gbm_) {
+      return 0;
+    }  // haven't called train or LoadModel.
     CHECK(!this->need_configuration_);
     return this->gbm_->BoostedRounds();
   }
+
   uint32_t Groups() const override {
     CHECK(!this->need_configuration_);
-    return this->learner_model_param_.num_output_group;
+    this->CheckModelInitialized();
+    return this->model_state_.num_output_group;
   }
 
   XGBAPIThreadLocalEntry& GetThreadLocal() const override {
     return (*LearnerAPIThreadLocalStore::Get())[this];
   }
 
-  void InplacePredict(dmlc::any const &x, std::shared_ptr<DMatrix> p_m,
-                      PredictionType type, float missing,
-                      HostDeviceVector<bst_float> **out_preds,
-                      uint32_t iteration_begin,
-                      uint32_t iteration_end) override {
+  void InplacePredict(std::shared_ptr<DMatrix> p_m, PredictionType type, float missing,
+                      HostDeviceVector<float>** out_preds, bst_layer_t iteration_begin,
+                      bst_layer_t iteration_end) override {
     this->Configure();
-    auto& out_predictions = this->GetThreadLocal().prediction_entry;
-    this->gbm_->InplacePredict(x, p_m, missing, &out_predictions,
-                               iteration_begin, iteration_end);
+    this->CheckModelInitialized();
+
+    auto& out_predictions = this->GetThreadLocal().predictions;
+    out_predictions.Resize(0);
+
+    this->gbm_->InplacePredict(p_m, missing, &out_predictions, iteration_begin, iteration_end);
+
     if (type == PredictionType::kValue) {
-      obj_->PredTransform(&out_predictions.predictions);
+      obj_->PredTransform(&out_predictions);
     } else if (type == PredictionType::kMargin) {
       // do nothing
     } else {
       LOG(FATAL) << "Unsupported prediction type:" << static_cast<int>(type);
     }
-    *out_preds = &out_predictions.predictions;
+    *out_preds = &out_predictions;
   }
 
   void CalcFeatureScore(std::string const& importance_type, common::Span<int32_t const> trees,
                         std::vector<bst_feature_t>* features, std::vector<float>* scores) override {
     this->Configure();
-    gbm_->FeatureScore(importance_type, trees, features, scores);
-  }
+    this->CheckModelInitialized();
 
-  const std::map<std::string, std::string>& GetConfigurationArguments() const override {
-    return cfg_;
+    gbm_->FeatureScore(importance_type, trees, features, scores);
   }
 
  protected:
@@ -1227,56 +1227,56 @@ class LearnerImpl : public LearnerIO {
    * \brief get un-transformed prediction
    * \param data training data matrix
    * \param out_preds output vector that stores the prediction
-   * \param ntree_limit limit number of trees used for boosted tree
-   *   predictor, when it equals 0, this means we are using all the trees
+   * \param layer_begin Beginning of the boosting iteration range.
+   * \param layer_end End of the boosting iteration range. Zero uses all iterations.
    * \param training allow dropout when the DART booster is being used
    */
-  void PredictRaw(DMatrix *data, PredictionCacheEntry *out_preds, bool training,
+  void PredictRaw(std::shared_ptr<DMatrix> data, HostDeviceVector<float>* out_preds, bool training,
                   unsigned layer_begin, unsigned layer_end) const {
     CHECK(gbm_ != nullptr) << "Predict must happen after Load or configuration";
-    this->ValidateDMatrix(data, false);
+    this->CheckModelInitialized();
+    this->ValidateDMatrix(data.get(), false);
     gbm_->PredictBatch(data, out_preds, training, layer_begin, layer_end);
   }
 
   void ValidateDMatrix(DMatrix* p_fmat, bool is_training) const {
     MetaInfo const& info = p_fmat->Info();
-    info.Validate(generic_parameters_.gpu_id);
+    info.Validate(ctx_.Device());
 
-    auto const row_based_split = [this]() {
-      return tparam_.dsplit == DataSplitMode::kRow ||
-             tparam_.dsplit == DataSplitMode::kAuto;
-    };
-    if (row_based_split()) {
-      if (is_training) {
-        CHECK_EQ(learner_model_param_.num_feature, p_fmat->Info().num_col_)
-            << "Number of columns does not match number of features in "
-               "booster.";
-      } else {
-        CHECK_GE(learner_model_param_.num_feature, p_fmat->Info().num_col_)
-            << "Number of columns does not match number of features in "
-               "booster.";
-      }
+    if (is_training) {
+      CHECK_EQ(model_state_.num_feature, p_fmat->Info().num_col_)
+          << "Number of columns does not match number of features in "
+             "booster.";
+    } else {
+      CHECK_GE(model_state_.num_feature, p_fmat->Info().num_col_)
+          << "Number of columns does not match number of features in "
+             "booster.";
     }
 
     if (p_fmat->Info().num_row_ == 0) {
-      LOG(WARNING) << "Empty dataset at worker: " << rabit::GetRank();
+      error::WarnEmptyDataset();
+    }
+    if (!p_fmat->Info().base_margin_.Empty()) {
+      CHECK_EQ(p_fmat->Info().base_margin_.Shape(1), this->model_state_.OutputLength());
     }
   }
 
  private:
+  void GetGradient(HostDeviceVector<float> const& preds, MetaInfo const& info, std::int32_t iter,
+                   linalg::Matrix<GradientPair>* out_gpair) {
+    out_gpair->Reshape(info.num_row_, this->model_state_.OutputLength());
+    obj_->GetGradient(preds, info, iter, out_gpair);
+  }
+
   /*! \brief random number transformation seed. */
   static int32_t constexpr kRandSeedMagic = 127;
   // gradient pairs
-  HostDeviceVector<GradientPair> gpair_;
-  /*! \brief Temporary storage to prediction.  Useful for storing data transformed by
-   *  objective function */
-  PredictionContainer output_predictions_;
+  GradientContainer gpair_;
 };
 
 constexpr int32_t LearnerImpl::kRandSeedMagic;
 
-Learner* Learner::Create(
-    const std::vector<std::shared_ptr<DMatrix> >& cache_data) {
+Learner* Learner::Create(const std::vector<std::shared_ptr<DMatrix>>& cache_data) {
   return new LearnerImpl(cache_data);
 }
 }  // namespace xgboost

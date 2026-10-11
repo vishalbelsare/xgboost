@@ -1,20 +1,29 @@
-"""Experimental support for categorical data.  After 1.5 XGBoost `gpu_hist` tree method
-has experimental support for one-hot encoding based tree split.
+"""
+Getting started with categorical data
+=====================================
+
+Experimental support for categorical data.
 
 In before, users need to run an encoder themselves before passing the data into XGBoost,
-which creates a sparse matrix and potentially increase memory usage.  This demo showcases
-the experimental categorical data support, more advanced features are planned.
+which creates a sparse matrix and potentially increase memory usage.  This demo
+showcases the experimental categorical data support, more advanced features are planned.
 
-Also, see the tutorial for using XGBoost with categorical data:
-https://xgboost.readthedocs.io/en/latest/tutorials/categorical.html
+  .. versionadded:: 1.5.0
 
-    .. versionadded:: 1.5.0
+See Also
+--------
+- :doc:`Tutorial </tutorials/categorical>`
+- :ref:`sphx_glr_python_examples_cat_in_the_dat.py`
+- :ref:`sphx_glr_python_examples_cat_pipeline.py`
 
 """
-import pandas as pd
-import numpy as np
-import xgboost as xgb
+
 from typing import Tuple
+
+import numpy as np
+import pandas as pd
+
+import xgboost as xgb
 
 
 def make_categorical(
@@ -47,16 +56,21 @@ def make_categorical(
 
 def main() -> None:
     # Use builtin categorical data support
-    # For scikit-learn interface, the input data must be pandas DataFrame or cudf
-    # DataFrame with categorical features
+
+    # For scikit-learn interface, the input data should be pandas DataFrame or cudf
+    # DataFrame with categorical features. If an numpy/cupy array is used instead, the
+    # `feature_types` for `XGBRegressor` should be set accordingly.
     X, y = make_categorical(100, 10, 4, False)
-    # Specify `enable_categorical` to True.
-    reg = xgb.XGBRegressor(tree_method="gpu_hist", enable_categorical=True)
+    # Specify `enable_categorical` to True, also we use onehot-encoding-based split here
+    # for demonstration. For details see the document of `max_cat_to_onehot`.
+    reg = xgb.XGBRegressor(
+        tree_method="hist", enable_categorical=True, max_cat_to_onehot=5, device="cuda"
+    )
     reg.fit(X, y, eval_set=[(X, y)])
 
     # Pass in already encoded data
     X_enc, y_enc = make_categorical(100, 10, 4, True)
-    reg_enc = xgb.XGBRegressor(tree_method="gpu_hist")
+    reg_enc = xgb.XGBRegressor(tree_method="hist", device="cuda")
     reg_enc.fit(X_enc, y_enc, eval_set=[(X_enc, y_enc)])
 
     reg_results = np.array(reg.evals_result()["validation_0"]["rmse"])

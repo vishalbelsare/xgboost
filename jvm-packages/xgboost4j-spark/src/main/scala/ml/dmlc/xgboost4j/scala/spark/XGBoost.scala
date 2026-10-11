@@ -1,5 +1,5 @@
 /*
- Copyright (c) 2014,2021 by Contributors
+ Copyright (c) 2014-2026 by Contributors
 
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.
@@ -18,246 +18,158 @@ package ml.dmlc.xgboost4j.scala.spark
 
 import java.io.File
 
-import scala.collection.mutable
-import scala.util.Random
-import scala.collection.JavaConverters._
-import ml.dmlc.xgboost4j.java.{IRabitTracker, Rabit, XGBoostError, RabitTracker => PyRabitTracker}
-import ml.dmlc.xgboost4j.scala.rabit.RabitTracker
-import ml.dmlc.xgboost4j.scala.spark.params.LearningTaskParams
-import ml.dmlc.xgboost4j.scala.ExternalCheckpointManager
-import ml.dmlc.xgboost4j.scala.{XGBoost => SXGBoost, _}
-import ml.dmlc.xgboost4j.{LabeledPoint => XGBLabeledPoint}
+import scala.jdk.CollectionConverters._
+
 import org.apache.commons.io.FileUtils
 import org.apache.commons.logging.LogFactory
-import org.apache.hadoop.fs.FileSystem
+import org.apache.spark.{SparkConf, SparkContext, TaskContext}
 import org.apache.spark.rdd.RDD
-import org.apache.spark.{SparkContext, SparkParallelismTracker, TaskContext}
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.resource.{ResourceProfileBuilder, TaskResourceRequests}
 
-/**
- * Rabit tracker configurations.
- *
- * @param workerConnectionTimeout The timeout for all workers to connect to the tracker.
- *                                Set timeout length to zero to disable timeout.
- *                                Use a finite, non-zero timeout value to prevent tracker from
- *                                hanging indefinitely (in milliseconds)
- *                                (supported by "scala" implementation only.)
- * @param trackerImpl Choice between "python" or "scala". The former utilizes the Java wrapper of
- *                    the Python Rabit tracker (in dmlc_core), whereas the latter is implemented
- *                    in Scala without Python components, and with full support of timeouts.
- *                    The Scala implementation is currently experimental, use at your own risk.
- */
-case class TrackerConf(workerConnectionTimeout: Long, trackerImpl: String )
+import ml.dmlc.xgboost4j.java.{Communicator, ConfigContext, RabitTracker, XGBoostJNI}
+import ml.dmlc.xgboost4j.scala.{XGBoost => SXGBoost, _}
+import ml.dmlc.xgboost4j.scala.spark.Utils.withResource
 
-object TrackerConf {
-  def apply(): TrackerConf = TrackerConf(0L, "python")
-}
 
-private[this] case class XGBoostExecutionEarlyStoppingParams(numEarlyStoppingRounds: Int,
-                                                             maximizeEvalMetrics: Boolean)
-
-private[this] case class XGBoostExecutionInputParams(trainTestRatio: Double, seed: Long)
-
-private[spark] case class XGBoostExecutionParams(
+private[spark] case class RuntimeParams(
     numWorkers: Int,
     numRounds: Int,
-    useExternalMemory: Boolean,
-    obj: ObjectiveTrait,
-    eval: EvalTrait,
-    missing: Float,
-    allowNonZeroForMissing: Boolean,
     trackerConf: TrackerConf,
-    timeoutRequestWorkers: Long,
-    checkpointParam: Option[ExternalCheckpointParams],
-    xgbInputParams: XGBoostExecutionInputParams,
-    earlyStoppingParams: XGBoostExecutionEarlyStoppingParams,
-    cacheTrainingSet: Boolean,
-    treeMethod: Option[String],
+    earlyStoppingRounds: Int,
+    device: String,
     isLocal: Boolean,
-    killSparkContextOnWorkerFailure: Boolean) {
+    runOnGpu: Boolean,
+    obj: Option[ObjectiveTrait] = None,
+    eval: Option[EvalTrait] = None,
+    configs: Map[String, AnyRef] = Map.empty)
 
-  private var rawParamMap: Map[String, Any] = _
-
-  def setRawParamMap(inputMap: Map[String, Any]): Unit = {
-    rawParamMap = inputMap
-  }
-
-  def toMap: Map[String, Any] = {
-    rawParamMap
-  }
-}
-
-private[this] class XGBoostExecutionParamsFactory(rawParams: Map[String, Any], sc: SparkContext){
-
+/**
+ * A trait to manage stage-level scheduling
+ */
+private[spark] trait StageLevelScheduling extends Serializable {
   private val logger = LogFactory.getLog("XGBoostSpark")
 
-  private val isLocal = sc.isLocal
-
-  private val overridedParams = overrideParams(rawParams, sc)
-
-  /**
-   * Check to see if Spark expects SSL encryption (`spark.ssl.enabled` set to true).
-   * If so, throw an exception unless this safety measure has been explicitly overridden
-   * via conf `xgboost.spark.ignoreSsl`.
-   */
-  private def validateSparkSslConf: Unit = {
-    val (sparkSslEnabled: Boolean, xgboostSparkIgnoreSsl: Boolean) =
-      SparkSession.getActiveSession match {
-        case Some(ss) =>
-          (ss.conf.getOption("spark.ssl.enabled").getOrElse("false").toBoolean,
-            ss.conf.getOption("xgboost.spark.ignoreSsl").getOrElse("false").toBoolean)
-        case None =>
-          (sc.getConf.getBoolean("spark.ssl.enabled", false),
-            sc.getConf.getBoolean("xgboost.spark.ignoreSsl", false))
-      }
-    if (sparkSslEnabled) {
-      if (xgboostSparkIgnoreSsl) {
-        logger.warn(s"spark-xgboost is being run without encrypting data in transit!  " +
-          s"Spark Conf spark.ssl.enabled=true was overridden with xgboost.spark.ignoreSsl=true.")
-      } else {
-        throw new Exception("xgboost-spark found spark.ssl.enabled=true to encrypt data " +
-          "in transit, but xgboost-spark sends non-encrypted data over the wire for efficiency. " +
-          "To override this protection and still use xgboost-spark at your own risk, " +
-          "you can set the SparkSession conf to use xgboost.spark.ignoreSsl=true.")
-      }
-    }
+  private[spark] def isStandaloneOrLocalCluster(conf: SparkConf): Boolean = {
+    val master = conf.get("spark.master")
+    master != null && (master.startsWith("spark://") || master.startsWith("local-cluster"))
   }
 
   /**
-   * we should not include any nested structure in the output of this function as the map is
-   * eventually to be feed to xgboost4j layer
+   * To determine if stage-level scheduling should be skipped according to the spark version
+   * and spark configurations
+   *
+   * @param sparkVersion spark version
+   * @param runOnGpu     if xgboost training run on GPUs
+   * @param conf         spark configurations
+   * @return Boolean to skip stage-level scheduling or not
    */
-  private def overrideParams(
-      params: Map[String, Any],
-      sc: SparkContext): Map[String, Any] = {
-    val coresPerTask = sc.getConf.getInt("spark.task.cpus", 1)
-    var overridedParams = params
-    if (overridedParams.contains("nthread")) {
-      val nThread = overridedParams("nthread").toString.toInt
-      require(nThread <= coresPerTask,
-        s"the nthread configuration ($nThread) must be no larger than " +
-          s"spark.task.cpus ($coresPerTask)")
+  private[spark] def skipStageLevelScheduling(sparkVersion: String,
+                                              runOnGpu: Boolean,
+                                              conf: SparkConf): Boolean = {
+    if (runOnGpu) {
+      if (sparkVersion < "3.4.0") {
+        logger.info("Stage-level scheduling in xgboost requires spark version 3.4.0+")
+        return true
+      }
+
+      if (!isStandaloneOrLocalCluster(conf)) {
+        logger.info("Stage-level scheduling in xgboost requires spark standalone or " +
+          "local-cluster mode")
+        return true
+      }
+
+      val executorCores = conf.getInt("spark.executor.cores", -1)
+      val executorGpus = conf.getInt("spark.executor.resource.gpu.amount", -1)
+      if (executorCores == -1 || executorGpus == -1) {
+        logger.info("Stage-level scheduling in xgboost requires spark.executor.cores, " +
+          "spark.executor.resource.gpu.amount to be set.")
+        return true
+      }
+
+      if (executorCores == 1) {
+        logger.info("Stage-level scheduling in xgboost requires spark.executor.cores > 1")
+        return true
+      }
+
+      if (executorGpus > 1) {
+        logger.info("Stage-level scheduling in xgboost will not work " +
+          "when spark.executor.resource.gpu.amount > 1")
+        return true
+      }
+
+      val taskGpuAmount = conf.getDouble("spark.task.resource.gpu.amount", -1.0).toFloat
+
+      if (taskGpuAmount == -1.0) {
+        // The ETL tasks will not grab a gpu when spark.task.resource.gpu.amount is not set,
+        // but with stage-level scheduling, we can make training task grab the gpu.
+        return false
+      }
+
+      if (taskGpuAmount == executorGpus.toFloat) {
+        // spark.executor.resource.gpu.amount = spark.task.resource.gpu.amount
+        // results in only 1 task running at a time, which may cause perf issue.
+        return true
+      }
+      // We can enable stage-level scheduling
+      false
+    } else true // Skip stage-level scheduling for cpu training.
+  }
+
+  /**
+   * Attempt to modify the task resources so that only one task can be executed
+   * on a single executor simultaneously.
+   *
+   * @param sc  the spark context
+   * @param rdd the rdd to be applied with new resource profile
+   * @return the original rdd or the modified rdd
+   */
+  private[spark] def tryStageLevelScheduling[T](sc: SparkContext,
+                                                xgbExecParams: RuntimeParams,
+                                                rdd: RDD[T]
+                                               ): RDD[T] = {
+
+    val conf = sc.getConf
+    if (skipStageLevelScheduling(sc.version, xgbExecParams.runOnGpu, conf)) {
+      return rdd
+    }
+
+    // Ensure executor_cores is not None
+    val executor_cores = conf.getInt("spark.executor.cores", -1)
+    if (executor_cores == -1) {
+      throw new RuntimeException("Wrong spark.executor.cores")
+    }
+
+    // Spark-rapids is a GPU-acceleration project for Spark SQL.
+    // When spark-rapids is enabled, we prevent concurrent execution of other ETL tasks
+    // that utilize GPUs alongside training tasks in order to avoid GPU out-of-memory errors.
+    val spark_plugins = conf.get("spark.plugins", " ")
+    val spark_rapids_sql_enabled = conf.get("spark.rapids.sql.enabled", "true")
+
+    // Determine the number of cores required for each task.
+    val task_cores = if (spark_plugins.contains("com.nvidia.spark.SQLPlugin") &&
+      spark_rapids_sql_enabled.toLowerCase == "true") {
+      executor_cores
     } else {
-      overridedParams = overridedParams + ("nthread" -> coresPerTask)
+      (executor_cores / 2) + 1
     }
 
-    val numEarlyStoppingRounds = overridedParams.getOrElse(
-      "num_early_stopping_rounds", 0).asInstanceOf[Int]
-    overridedParams += "num_early_stopping_rounds" -> numEarlyStoppingRounds
-    if (numEarlyStoppingRounds > 0 &&
-      !overridedParams.contains("maximize_evaluation_metrics")) {
-      if (overridedParams.getOrElse("custom_eval", null) != null) {
-        throw new IllegalArgumentException("custom_eval does not support early stopping")
-      }
-      val eval_metric = overridedParams("eval_metric").toString
-      val maximize = LearningTaskParams.evalMetricsToMaximize contains eval_metric
-      logger.info("parameter \"maximize_evaluation_metrics\" is set to " + maximize)
-      overridedParams += ("maximize_evaluation_metrics" -> maximize)
-    }
-    overridedParams
+    // Each training task requires cpu cores > total executor cores//2 + 1 to
+    // ensure tasks are sent to different executors.
+    // Note: We cannot use GPUs to limit concurrent tasks
+    // due to https://issues.apache.org/jira/browse/SPARK-45527.
+    val task_gpus = 1.0
+    val treqs = new TaskResourceRequests().cpus(task_cores).resource("gpu", task_gpus)
+    val rp = new ResourceProfileBuilder().require(treqs).build()
+
+    logger.info(s"XGBoost training tasks require the resource(cores=$task_cores, gpu=$task_gpus).")
+    rdd.withResources(rp)
   }
-
-  def buildXGBRuntimeParams: XGBoostExecutionParams = {
-    val nWorkers = overridedParams("num_workers").asInstanceOf[Int]
-    val round = overridedParams("num_round").asInstanceOf[Int]
-    val useExternalMemory = overridedParams("use_external_memory").asInstanceOf[Boolean]
-    val obj = overridedParams.getOrElse("custom_obj", null).asInstanceOf[ObjectiveTrait]
-    val eval = overridedParams.getOrElse("custom_eval", null).asInstanceOf[EvalTrait]
-    val missing = overridedParams.getOrElse("missing", Float.NaN).asInstanceOf[Float]
-    val allowNonZeroForMissing = overridedParams
-                                 .getOrElse("allow_non_zero_for_missing", false)
-                                 .asInstanceOf[Boolean]
-    validateSparkSslConf
-    var treeMethod: Option[String] = None
-    if (overridedParams.contains("tree_method")) {
-      require(overridedParams("tree_method") == "hist" ||
-        overridedParams("tree_method") == "approx" ||
-        overridedParams("tree_method") == "auto" ||
-        overridedParams("tree_method") == "gpu_hist", "xgboost4j-spark only supports tree_method" +
-        " as 'hist', 'approx', 'gpu_hist', and 'auto'")
-      treeMethod = Some(overridedParams("tree_method").asInstanceOf[String])
-    }
-    if (overridedParams.contains("train_test_ratio")) {
-      logger.warn("train_test_ratio is deprecated since XGBoost 0.82, we recommend to explicitly" +
-        " pass a training and multiple evaluation datasets by passing 'eval_sets' and " +
-        "'eval_set_names'")
-    }
-    require(nWorkers > 0, "you must specify more than 0 workers")
-    if (obj != null) {
-      require(overridedParams.get("objective_type").isDefined, "parameter \"objective_type\" " +
-        "is not defined, you have to specify the objective type as classification or regression" +
-        " with a customized objective function")
-    }
-    val trackerConf = overridedParams.get("tracker_conf") match {
-      case None => TrackerConf()
-      case Some(conf: TrackerConf) => conf
-      case _ => throw new IllegalArgumentException("parameter \"tracker_conf\" must be an " +
-        "instance of TrackerConf.")
-    }
-    val timeoutRequestWorkers: Long = overridedParams.get("timeout_request_workers") match {
-      case None => 0L
-      case Some(interval: Long) => interval
-      case _ => throw new IllegalArgumentException("parameter \"timeout_request_workers\" must be" +
-        " an instance of Long.")
-    }
-    val checkpointParam =
-      ExternalCheckpointParams.extractParams(overridedParams)
-
-    val trainTestRatio = overridedParams.getOrElse("train_test_ratio", 1.0)
-      .asInstanceOf[Double]
-    val seed = overridedParams.getOrElse("seed", System.nanoTime()).asInstanceOf[Long]
-    val inputParams = XGBoostExecutionInputParams(trainTestRatio, seed)
-
-    val earlyStoppingRounds = overridedParams.getOrElse(
-      "num_early_stopping_rounds", 0).asInstanceOf[Int]
-    val maximizeEvalMetrics = overridedParams.getOrElse(
-      "maximize_evaluation_metrics", true).asInstanceOf[Boolean]
-    val xgbExecEarlyStoppingParams = XGBoostExecutionEarlyStoppingParams(earlyStoppingRounds,
-      maximizeEvalMetrics)
-
-    val cacheTrainingSet = overridedParams.getOrElse("cache_training_set", false)
-      .asInstanceOf[Boolean]
-
-    val killSparkContext = overridedParams.getOrElse("kill_spark_context_on_worker_failure", true)
-      .asInstanceOf[Boolean]
-
-    val xgbExecParam = XGBoostExecutionParams(nWorkers, round, useExternalMemory, obj, eval,
-      missing, allowNonZeroForMissing, trackerConf,
-      timeoutRequestWorkers,
-      checkpointParam,
-      inputParams,
-      xgbExecEarlyStoppingParams,
-      cacheTrainingSet,
-      treeMethod,
-      isLocal,
-      killSparkContext)
-    xgbExecParam.setRawParamMap(overridedParams)
-    xgbExecParam
-  }
-
-  private[spark] def buildRabitParams : Map[String, String] = Map(
-    "rabit_reduce_ring_mincount" ->
-      overridedParams.getOrElse("rabit_ring_reduce_threshold", 32 << 10).toString,
-    "rabit_debug" ->
-      (overridedParams.getOrElse("verbosity", 0).toString.toInt == 3).toString,
-    "rabit_timeout" ->
-      (overridedParams.getOrElse("rabit_timeout", -1).toString.toInt >= 0).toString,
-    "rabit_timeout_sec" -> {
-      if (overridedParams.getOrElse("rabit_timeout", -1).toString.toInt >= 0) {
-        overridedParams.get("rabit_timeout").toString
-      } else {
-        "1800"
-      }
-    },
-    "DMLC_WORKER_CONNECT_RETRY" ->
-      overridedParams.getOrElse("dmlc_worker_connect_retry", 5).toString
-  )
 }
 
-object XGBoost extends Serializable {
+private[spark] object XGBoost extends StageLevelScheduling {
   private val logger = LogFactory.getLog("XGBoostSpark")
 
-  private def getGPUAddrFromResources: Int = {
+  def getGPUAddrFromResources: Int = {
     val tc = TaskContext.get()
     if (tc == null) {
       throw new RuntimeException("Something wrong for task context")
@@ -277,206 +189,142 @@ object XGBoost extends Serializable {
     }
   }
 
-  private def buildDistributedBooster(
-      watches: Watches,
-      xgbExecutionParam: XGBoostExecutionParams,
-      rabitEnv: java.util.Map[String, String],
-      obj: ObjectiveTrait,
-      eval: EvalTrait,
-      prevBooster: Booster): Iterator[(Booster, Map[String, Array[Float]])] = {
-    // to workaround the empty partitions in training dataset,
-    // this might not be the best efficient implementation, see
-    // (https://github.com/dmlc/xgboost/issues/1277)
-    if (!watches.toMap.contains("train")) {
-      throw new XGBoostError(
-        s"detected an empty partition in the training data, partition ID:" +
-          s" ${TaskContext.getPartitionId()}")
-    }
-    val taskId = TaskContext.getPartitionId().toString
-    val attempt = TaskContext.get().attemptNumber.toString
-    rabitEnv.put("DMLC_TASK_ID", taskId)
-    rabitEnv.put("DMLC_NUM_ATTEMPT", attempt)
-    val numRounds = xgbExecutionParam.numRounds
-    val makeCheckpoint = xgbExecutionParam.checkpointParam.isDefined && taskId.toInt == 0
-    try {
-      Rabit.init(rabitEnv)
-      val numEarlyStoppingRounds = xgbExecutionParam.earlyStoppingParams.numEarlyStoppingRounds
-      val metrics = Array.tabulate(watches.size)(_ => Array.ofDim[Float](numRounds))
-      val externalCheckpointParams = xgbExecutionParam.checkpointParam
 
-      var params = xgbExecutionParam.toMap
-      if (xgbExecutionParam.treeMethod.exists(m => m == "gpu_hist")) {
-        val gpuId = if (xgbExecutionParam.isLocal) {
-          // For local mode, force gpu id to primary device
-          0
-        } else {
-          getGPUAddrFromResources
-        }
-        logger.info("Leveraging gpu device " + gpuId + " to train")
-        params = params + ("gpu_id" -> gpuId)
-      }
-      val booster = if (makeCheckpoint) {
-        SXGBoost.trainAndSaveCheckpoint(
-          watches.toMap("train"), params, numRounds,
-          watches.toMap, metrics, obj, eval,
-          earlyStoppingRound = numEarlyStoppingRounds, prevBooster, externalCheckpointParams)
-      } else {
-        SXGBoost.train(watches.toMap("train"), params, numRounds,
-          watches.toMap, metrics, obj, eval,
-          earlyStoppingRound = numEarlyStoppingRounds, prevBooster)
-      }
-      Iterator(booster -> watches.toMap.keys.zip(metrics).toMap)
-    } catch {
-      case xgbException: XGBoostError =>
-        logger.error(s"XGBooster worker $taskId has failed $attempt times due to ", xgbException)
-        throw xgbException
-    } finally {
-      Rabit.shutdown()
-      watches.delete()
-    }
-  }
+  /**
+   * Train a XGBoost Boost on the dataset in the Watches
+   *
+   * @param watches       holds the dataset to be trained
+   * @param runtimeParams XGBoost runtime parameters
+   * @param xgboostParams XGBoost library parameters
+   * @return a booster and the metrics
+   */
+  private def trainBooster(watches: Watches,
+                           runtimeParams: RuntimeParams,
+                           xgboostParams: Map[String, Any]
+                          ): (Booster, Array[Array[Float]]) = {
 
-  private def startTracker(nWorkers: Int, trackerConf: TrackerConf): IRabitTracker = {
-    val tracker: IRabitTracker = trackerConf.trackerImpl match {
-      case "scala" => new RabitTracker(nWorkers)
-      case "python" => new PyRabitTracker(nWorkers)
-      case _ => new PyRabitTracker(nWorkers)
-    }
+    val numEarlyStoppingRounds = runtimeParams.earlyStoppingRounds
+    val metrics = Array.tabulate(watches.size)(_ =>
+      Array.ofDim[Float](runtimeParams.numRounds))
 
-    require(tracker.start(trackerConf.workerConnectionTimeout), "FAULT: Failed to start tracker")
-    tracker
+    val booster = SXGBoost.train(watches.toMap("train"), xgboostParams, runtimeParams.numRounds,
+      watches.toMap, metrics, runtimeParams.obj.orNull,
+      runtimeParams.eval.orNull, earlyStoppingRound = numEarlyStoppingRounds)
+    (booster, metrics)
   }
 
   /**
-   * @return A tuple of the booster and the metrics used to build training summary
+   * Sets the CUDA device for current process.
+   *
+   * Note: Process exclusive mode is not required because we rely on Spark's resource
+   * scheduler to properly assign GPU resources and prevent multiple executors from
+   * using the same GPU simultaneously.
+   *
+   * @param addr The GPU device address/ID to set and acquire
+   * @return The same GPU device address that was passed in
    */
-  @throws(classOf[XGBoostError])
-  private[spark] def trainDistributed(
-      sc: SparkContext,
-      buildTrainingData: XGBoostExecutionParams => (RDD[Watches], Option[RDD[_]]),
-      params: Map[String, Any]):
-    (Booster, Map[String, Array[Float]]) = {
+  private def setGpuDeviceAndAcquire(addr: Int): Int = {
+    XGBoostJNI.CudaSetDevice(addr.toInt)
+    addr
+  }
 
-    logger.info(s"Running XGBoost ${spark.VERSION} with parameters:\n${params.mkString("\n")}")
+  /**
+   * Train a XGBoost booster with parameters on the dataset
+   *
+   * @param input         the input dataset for training
+   * @param runtimeParams the runtime parameters for jvm
+   * @param xgboostParams the xgboost parameters to pass to xgboost library
+   * @return the booster and the metrics
+   */
+  def train(input: RDD[Watches],
+            runtimeParams: RuntimeParams,
+            xgboostParams: Map[String, Any]): (Booster, Map[String, Array[Float]]) = {
 
-    val xgbParamsFactory = new XGBoostExecutionParamsFactory(params, sc)
-    val xgbExecParams = xgbParamsFactory.buildXGBRuntimeParams
-    val xgbRabitParams = xgbParamsFactory.buildRabitParams.asJava
+    val sc = input.sparkContext
+    logger.info(s"Running XGBoost ${spark.VERSION} with parameters: $xgboostParams")
 
-    val prevBooster = xgbExecParams.checkpointParam.map { checkpointParam =>
-      val checkpointManager = new ExternalCheckpointManager(
-        checkpointParam.checkpointPath,
-        FileSystem.get(sc.hadoopConfiguration))
-      checkpointManager.cleanUpHigherVersions(xgbExecParams.numRounds)
-      checkpointManager.loadCheckpointAsScalaBooster()
-    }.orNull
+    // TODO Rabit tracker exception handling.
+    val trackerConf = runtimeParams.trackerConf
 
-    // Get the training data RDD and the cachedRDD
-    val (trainingRDD, optionalCachedRDD) = buildTrainingData(xgbExecParams)
+    val tracker = new RabitTracker(runtimeParams.numWorkers,
+      trackerConf.hostIp, trackerConf.port, trackerConf.timeout)
+    require(tracker.start(), "FAULT: Failed to start tracker")
 
     try {
-      // Train for every ${savingRound} rounds and save the partially completed booster
-      val tracker = startTracker(xgbExecParams.numWorkers, xgbExecParams.trackerConf)
-      val (booster, metrics) = try {
-        val parallelismTracker = new SparkParallelismTracker(sc,
-          xgbExecParams.timeoutRequestWorkers,
-          xgbExecParams.numWorkers,
-          xgbExecParams.killSparkContextOnWorkerFailure)
+      val rabitEnv = tracker.getWorkerArgs
 
-        tracker.getWorkerEnvs().putAll(xgbRabitParams)
-        val rabitEnv = tracker.getWorkerEnvs
+      val boostersAndMetrics = input.barrier().mapPartitions { iter =>
+        val partitionId = TaskContext.getPartitionId()
 
-        val boostersAndMetrics = trainingRDD.mapPartitions { iter => {
-          var optionWatches: Option[Watches] = None
-
-          // take the first Watches to train
-          if (iter.hasNext) {
-            optionWatches = Some(iter.next())
+        var params = xgboostParams
+        // Set GPU device ID if possible
+        if (runtimeParams.runOnGpu) {
+          val gpuId = if (runtimeParams.isLocal) {
+            partitionId % runtimeParams.numWorkers
+          } else {
+            getGPUAddrFromResources
           }
-
-          optionWatches.map { watches => buildDistributedBooster(watches, xgbExecParams, rabitEnv,
-            xgbExecParams.obj, xgbExecParams.eval, prevBooster)}
-            .getOrElse(throw new RuntimeException("No Watches to train"))
-
-        }}.cache()
-
-        val sparkJobThread = new Thread() {
-          override def run() {
-            // force the job
-            boostersAndMetrics.foreachPartition(() => _)
-          }
-        }
-        sparkJobThread.setUncaughtExceptionHandler(tracker)
-
-        val trackerReturnVal = parallelismTracker.execute {
-          sparkJobThread.start()
-          tracker.waitFor(0L)
+          logger.info("Leveraging gpu device " + gpuId + " to train")
+          setGpuDeviceAndAcquire(gpuId)
+          params = params + ("device" -> s"cuda:$gpuId")
         }
 
-        logger.info(s"Rabit returns with exit code $trackerReturnVal")
-        val (booster, metrics) = postTrackerReturnProcessing(trackerReturnVal,
-          boostersAndMetrics, sparkJobThread)
-        (booster, metrics)
-      } finally {
-        tracker.stop()
-      }
-      // we should delete the checkpoint directory after a successful training
-      xgbExecParams.checkpointParam.foreach {
-        cpParam =>
-          if (!xgbExecParams.checkpointParam.get.skipCleanCheckpoint) {
-            val checkpointManager = new ExternalCheckpointManager(
-              cpParam.checkpointPath,
-              FileSystem.get(sc.hadoopConfiguration))
-            checkpointManager.cleanPath()
+        rabitEnv.put("DMLC_TASK_ID", partitionId.toString)
+        try {
+          Communicator.init(rabitEnv)
+          require(iter.hasNext, "Failed to create DMatrix")
+
+          withResource(new ConfigContext(runtimeParams.configs.asJava)) { _ =>
+            val watches = iter.next()
+            try {
+              val (booster, metrics) = trainBooster(watches, runtimeParams, params)
+              if (partitionId == 0) {
+                Iterator(booster -> watches.toMap.keys.zip(metrics).toMap)
+              } else {
+                Iterator.empty
+              }
+            } finally {
+              if (watches != null) {
+                watches.delete()
+              }
+            }
           }
+        } finally {
+          // If shutdown throws exception, then the real exception for
+          // training will be swallowed,
+          try {
+            Communicator.shutdown()
+          } catch {
+            case e: Throwable =>
+              logger.error("Communicator.shutdown error: ", e)
+          }
+        }
       }
+
+      val rdd = tryStageLevelScheduling(sc, runtimeParams, boostersAndMetrics)
+      // The repartition step is to make training stage as ShuffleMapStage, so that when one
+      // of the training task fails the training stage can retry. ResultStage won't retry when
+      // it fails.
+      val (booster, metrics) = rdd.repartition(1).collect()(0)
       (booster, metrics)
     } catch {
       case t: Throwable =>
         // if the job was aborted due to an exception
-        logger.error("the job was aborted due to ", t)
-        if (xgbExecParams.killSparkContextOnWorkerFailure) {
-          sc.stop()
-        }
+        logger.error("XGBoost job was aborted due to ", t)
         throw t
     } finally {
-      optionalCachedRDD.foreach(_.unpersist())
-    }
-  }
-
-  private def postTrackerReturnProcessing(
-      trackerReturnVal: Int,
-      distributedBoostersAndMetrics: RDD[(Booster, Map[String, Array[Float]])],
-      sparkJobThread: Thread): (Booster, Map[String, Array[Float]]) = {
-    if (trackerReturnVal == 0) {
-      // Copies of the final booster and the corresponding metrics
-      // reside in each partition of the `distributedBoostersAndMetrics`.
-      // Any of them can be used to create the model.
-      // it's safe to block here forever, as the tracker has returned successfully, and the Spark
-      // job should have finished, there is no reason for the thread cannot return
-      sparkJobThread.join()
-      val (booster, metrics) = distributedBoostersAndMetrics.first()
-      distributedBoostersAndMetrics.unpersist(false)
-      (booster, metrics)
-    } else {
       try {
-        if (sparkJobThread.isAlive) {
-          sparkJobThread.interrupt()
-        }
+        tracker.stop()
       } catch {
-        case _: InterruptedException =>
-          logger.info("spark job thread is interrupted")
+        case t: Throwable => logger.error(t)
       }
-      throw new XGBoostError("XGBoostModel training failed")
     }
   }
-
 }
 
-class Watches private(
-    val datasets: Array[DMatrix],
-    val names: Array[String],
-    val cacheDirName: Option[String]) {
+class Watches private[scala](val datasets: Array[DMatrix],
+                             val names: Array[String],
+                             val cacheDirName: Option[String]) {
 
   def toMap: Map[String, DMatrix] = {
     names.zip(datasets).toMap.filter { case (_, matrix) => matrix.rowNum > 0 }
@@ -494,194 +342,14 @@ class Watches private(
   override def toString: String = toMap.toString
 }
 
-private object Watches {
-
-  private def fromBaseMarginsToArray(baseMargins: Iterator[Float]): Option[Array[Float]] = {
-    val builder = new mutable.ArrayBuilder.ofFloat()
-    var nTotal = 0
-    var nUndefined = 0
-    while (baseMargins.hasNext) {
-      nTotal += 1
-      val baseMargin = baseMargins.next()
-      if (baseMargin.isNaN) {
-        nUndefined += 1  // don't waste space for all-NaNs.
-      } else {
-        builder += baseMargin
-      }
-    }
-    if (nUndefined == nTotal) {
-      None
-    } else if (nUndefined == 0) {
-      Some(builder.result())
-    } else {
-      throw new IllegalArgumentException(
-        s"Encountered a partition with $nUndefined NaN base margin values. " +
-          s"If you want to specify base margin, ensure all values are non-NaN.")
-    }
-  }
-
-  def buildWatches(
-      nameAndLabeledPointSets: Iterator[(String, Iterator[XGBLabeledPoint])],
-      cachedDirName: Option[String]): Watches = {
-    val dms = nameAndLabeledPointSets.map {
-      case (name, labeledPoints) =>
-        val baseMargins = new mutable.ArrayBuilder.ofFloat
-        val duplicatedItr = labeledPoints.map(labeledPoint => {
-          baseMargins += labeledPoint.baseMargin
-          labeledPoint
-        })
-        val dMatrix = new DMatrix(duplicatedItr, cachedDirName.map(_ + s"/$name").orNull)
-        val baseMargin = fromBaseMarginsToArray(baseMargins.result().iterator)
-        if (baseMargin.isDefined) {
-          dMatrix.setBaseMargin(baseMargin.get)
-        }
-        (name, dMatrix)
-    }.toArray
-    new Watches(dms.map(_._2), dms.map(_._1), cachedDirName)
-  }
-
-  def buildWatches(
-      xgbExecutionParams: XGBoostExecutionParams,
-      labeledPoints: Iterator[XGBLabeledPoint],
-      cacheDirName: Option[String]): Watches = {
-    val trainTestRatio = xgbExecutionParams.xgbInputParams.trainTestRatio
-    val seed = xgbExecutionParams.xgbInputParams.seed
-    val r = new Random(seed)
-    val testPoints = mutable.ArrayBuffer.empty[XGBLabeledPoint]
-    val trainBaseMargins = new mutable.ArrayBuilder.ofFloat
-    val testBaseMargins = new mutable.ArrayBuilder.ofFloat
-    val trainPoints = labeledPoints.filter { labeledPoint =>
-      val accepted = r.nextDouble() <= trainTestRatio
-      if (!accepted) {
-        testPoints += labeledPoint
-        testBaseMargins += labeledPoint.baseMargin
-      } else {
-        trainBaseMargins += labeledPoint.baseMargin
-      }
-      accepted
-    }
-    val trainMatrix = new DMatrix(trainPoints, cacheDirName.map(_ + "/train").orNull)
-    val testMatrix = new DMatrix(testPoints.iterator, cacheDirName.map(_ + "/test").orNull)
-
-    val trainMargin = fromBaseMarginsToArray(trainBaseMargins.result().iterator)
-    val testMargin = fromBaseMarginsToArray(testBaseMargins.result().iterator)
-    if (trainMargin.isDefined) trainMatrix.setBaseMargin(trainMargin.get)
-    if (testMargin.isDefined) testMatrix.setBaseMargin(testMargin.get)
-
-    new Watches(Array(trainMatrix, testMatrix), Array("train", "test"), cacheDirName)
-  }
-
-  def buildWatchesWithGroup(
-      nameAndlabeledPointGroupSets: Iterator[(String, Iterator[Array[XGBLabeledPoint]])],
-      cachedDirName: Option[String]): Watches = {
-    val dms = nameAndlabeledPointGroupSets.map {
-      case (name, labeledPointsGroups) =>
-        val baseMargins = new mutable.ArrayBuilder.ofFloat
-        val groupsInfo = new mutable.ArrayBuilder.ofInt
-        val weights = new mutable.ArrayBuilder.ofFloat
-        val iter = labeledPointsGroups.filter(labeledPointGroup => {
-          var groupWeight = -1.0f
-          var groupSize = 0
-          labeledPointGroup.map { labeledPoint => {
-            if (groupWeight < 0) {
-              groupWeight = labeledPoint.weight
-            } else if (groupWeight != labeledPoint.weight) {
-              throw new IllegalArgumentException("the instances in the same group have to be" +
-                s" assigned with the same weight (unexpected weight ${labeledPoint.weight}")
-            }
-            baseMargins += labeledPoint.baseMargin
-            groupSize += 1
-            labeledPoint
-          }
-          }
-          weights += groupWeight
-          groupsInfo += groupSize
-          true
-        })
-        val dMatrix = new DMatrix(iter.flatMap(_.iterator), cachedDirName.map(_ + s"/$name").orNull)
-        val baseMargin = fromBaseMarginsToArray(baseMargins.result().iterator)
-        if (baseMargin.isDefined) {
-          dMatrix.setBaseMargin(baseMargin.get)
-        }
-        dMatrix.setGroup(groupsInfo.result())
-        dMatrix.setWeight(weights.result())
-        (name, dMatrix)
-    }.toArray
-    new Watches(dms.map(_._2), dms.map(_._1), cachedDirName)
-  }
-
-  def buildWatchesWithGroup(
-      xgbExecutionParams: XGBoostExecutionParams,
-      labeledPointGroups: Iterator[Array[XGBLabeledPoint]],
-      cacheDirName: Option[String]): Watches = {
-    val trainTestRatio = xgbExecutionParams.xgbInputParams.trainTestRatio
-    val seed = xgbExecutionParams.xgbInputParams.seed
-    val r = new Random(seed)
-    val testPoints = mutable.ArrayBuilder.make[XGBLabeledPoint]
-    val trainBaseMargins = new mutable.ArrayBuilder.ofFloat
-    val testBaseMargins = new mutable.ArrayBuilder.ofFloat
-
-    val trainGroups = new mutable.ArrayBuilder.ofInt
-    val testGroups = new mutable.ArrayBuilder.ofInt
-
-    val trainWeights = new mutable.ArrayBuilder.ofFloat
-    val testWeights = new mutable.ArrayBuilder.ofFloat
-
-    val trainLabelPointGroups = labeledPointGroups.filter { labeledPointGroup =>
-      val accepted = r.nextDouble() <= trainTestRatio
-      if (!accepted) {
-        var groupWeight = -1.0f
-        var groupSize = 0
-        labeledPointGroup.foreach(labeledPoint => {
-          testPoints += labeledPoint
-          testBaseMargins += labeledPoint.baseMargin
-          if (groupWeight < 0) {
-            groupWeight = labeledPoint.weight
-          } else if (labeledPoint.weight != groupWeight) {
-            throw new IllegalArgumentException("the instances in the same group have to be" +
-              s" assigned with the same weight (unexpected weight ${labeledPoint.weight}")
-          }
-          groupSize += 1
-        })
-        testWeights += groupWeight
-        testGroups += groupSize
-      } else {
-        var groupWeight = -1.0f
-        var groupSize = 0
-        labeledPointGroup.foreach { labeledPoint => {
-          if (groupWeight < 0) {
-            groupWeight = labeledPoint.weight
-          } else if (labeledPoint.weight != groupWeight) {
-            throw new IllegalArgumentException("the instances in the same group have to be" +
-              s" assigned with the same weight (unexpected weight ${labeledPoint.weight}")
-          }
-          trainBaseMargins += labeledPoint.baseMargin
-          groupSize += 1
-        }}
-        trainWeights += groupWeight
-        trainGroups += groupSize
-      }
-      accepted
-    }
-
-    val trainPoints = trainLabelPointGroups.flatMap(_.iterator)
-    val trainMatrix = new DMatrix(trainPoints, cacheDirName.map(_ + "/train").orNull)
-    trainMatrix.setGroup(trainGroups.result())
-    trainMatrix.setWeight(trainWeights.result())
-
-    val testMatrix = new DMatrix(testPoints.result().iterator, cacheDirName.map(_ + "/test").orNull)
-    if (trainTestRatio < 1.0) {
-      testMatrix.setGroup(testGroups.result())
-      testMatrix.setWeight(testWeights.result())
-    }
-
-    val trainMargin = fromBaseMarginsToArray(trainBaseMargins.result().iterator)
-    val testMargin = fromBaseMarginsToArray(testBaseMargins.result().iterator)
-    if (trainMargin.isDefined) trainMatrix.setBaseMargin(trainMargin.get)
-    if (testMargin.isDefined) testMatrix.setBaseMargin(testMargin.get)
-
-    new Watches(Array(trainMatrix, testMatrix), Array("train", "test"), cacheDirName)
-  }
-}
-
-
+/**
+ * Rabit tracker configurations.
+ *
+ * @param timeout The number of seconds before timeout waiting for workers to connect. and
+ *                for the tracker to shutdown.
+ * @param hostIp  The Rabit Tracker host IP address.
+ *                This is only needed if the host IP cannot be automatically guessed.
+ * @param port    The port number for the tracker to listen to. Use a system allocated one by
+ *                default.
+ */
+private[spark] case class TrackerConf(timeout: Int = 0, hostIp: String = "", port: Int = 0)

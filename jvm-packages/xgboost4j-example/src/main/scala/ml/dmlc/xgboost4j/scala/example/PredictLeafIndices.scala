@@ -1,5 +1,5 @@
 /*
- Copyright (c) 2014 by Contributors
+ Copyright (c) 2014-2026 by Contributors
 
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.
@@ -16,17 +16,15 @@
 
 package ml.dmlc.xgboost4j.scala.example
 
-import java.util
-
 import scala.collection.mutable
 
-import ml.dmlc.xgboost4j.scala.{XGBoost, DMatrix}
+import ml.dmlc.xgboost4j.scala.{DMatrix, XGBoost}
 
 object PredictLeafIndices {
 
   def main(args: Array[String]): Unit = {
-    val trainMat = new DMatrix("../../demo/data/agaricus.txt.train")
-    val testMat = new DMatrix("../../demo/data/agaricus.txt.test")
+    val trainMat = new DMatrix("../../demo/data/agaricus.txt.train?format=libsvm")
+    val testMat = new DMatrix("../../demo/data/agaricus.txt.test?format=libsvm")
 
     val params = new mutable.HashMap[String, Any]()
     params += "eta" -> 1.0
@@ -41,16 +39,16 @@ object PredictLeafIndices {
     val round = 3
     val booster = XGBoost.train(trainMat, params.toMap, round, watches.toMap)
 
-    // predict using first 2 tree
+    // predict using the first 2 boosting iterations
     val leafIndex = booster.predictLeaf(testMat, 2)
-    for (leafs <- leafIndex) {
-      println(java.util.Arrays.toString(leafs))
+    if (leafIndex.length > 0 && leafIndex(0).length > 1) {
+      println(s"${leafIndex(0)(0)}, ${leafIndex(0)(1)}")
     }
 
-    // predict all trees
+    // predict all boosting iterations
     val leafIndex2 = booster.predictLeaf(testMat, 0)
-    for (leafs <- leafIndex) {
-      println(java.util.Arrays.toString(leafs))
+    if (leafIndex2.length > 0 && leafIndex2(0).length > 1) {
+      println(s"${leafIndex2(0)(0)}, ${leafIndex2(0)(1)}")
     }
   }
 }

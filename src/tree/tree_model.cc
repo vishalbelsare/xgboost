@@ -1,53 +1,98 @@
-/*!
- * Copyright 2015-2021 by Contributors
+/**
+ * Copyright 2015-2026, XGBoost Contributors
  * \file tree_model.cc
  * \brief model structure for tree
  */
-#include <dmlc/registry.h>
+#include "xgboost/tree_model.h"
+
 #include <dmlc/json.h>
+#include <dmlc/registry.h>
 
-#include <xgboost/tree_model.h>
-#include <xgboost/logging.h>
-#include <xgboost/json.h>
-
-#include <sstream>
-#include <limits>
 #include <cmath>
 #include <iomanip>
-#include <stack>
+#include <limits>  // for numeric_limits
+#include <sstream>
+#include <type_traits>  // for is_floating_point_v, add_const_t
 
+#include "../common/categorical.h"  // for GetNodeCats
+#include "../common/common.h"       // for EscapeU8
+#include "../common/nvtx_utils.h"   // for xgboost_NVTX_FN_RANGE
+#include "io_utils.h"               // for GetElem
 #include "param.h"
-#include "../common/common.h"
-#include "../common/categorical.h"
-#include "../predictor/predict_fn.h"
+#include "tree_view.h"
+#include "xgboost/base.h"
+#include "xgboost/data.h"
+#include "xgboost/json.h"
+#include "xgboost/logging.h"
 
 namespace xgboost {
-// register tree parameter
-DMLC_REGISTER_PARAMETER(TreeParam);
-
 namespace tree {
+void CopyCategoryStorage(Context const* ctx, std::size_t offset, ExpandBatch const& batch,
+                         HostDeviceVector<CatWordT>* out);
+
 DMLC_REGISTER_PARAMETER(TrainParam);
+}  // namespace tree
+
+namespace {
+constexpr auto NoTruncate() { return std::numeric_limits<bst_target_t>::max(); }
+
+template <typename Float>
+std::enable_if_t<std::is_floating_point_v<Float>, std::string> ToStr(
+    Float value, bst_target_t truncate_limit = NoTruncate()) {
+  (void)truncate_limit;
+  std::int32_t constexpr kFloatMaxPrecision = std::numeric_limits<float>::max_digits10;
+  static_assert(std::is_floating_point_v<Float>,
+                "Use std::to_string instead for non-floating point values.");
+  std::stringstream ss;
+  ss << std::setprecision(kFloatMaxPrecision) << value;
+  return ss.str();
 }
 
-/*!
- * \brief Base class for dump model implementation, modeling closely after code generator.
+template <typename Float>
+std::string ToStr(linalg::VectorView<Float> value, bst_target_t truncate_limit = 3) {
+  // Truncate long arrays to keep dumps (e.g. dot graphs) reasonably sized.
+  int32_t constexpr kFloatMaxPrecision = std::numeric_limits<float>::max_digits10;
+  static_assert(std::is_floating_point_v<Float>,
+                "Use std::to_string instead for non-floating point values.");
+  std::stringstream ss;
+  ss << std::setprecision(kFloatMaxPrecision);
+  if (value.Size() == 1) {
+    ss << value(0);
+    return ss.str();
+  }
+  CHECK_GE(truncate_limit, 2);
+  auto n = std::min(static_cast<bst_target_t>(value.Size() - 1), truncate_limit - 1);
+  ss << "[";
+  for (std::size_t i = 0; i < n; ++i) {
+    ss << value(i) << ", ";
+  }
+  if (value.Size() > truncate_limit) {
+    ss << "..., ";
+  }
+  ss << value(value.Size() - 1) << "]";
+  return ss.str();
+}
+
+std::string ToJsonStr(float value) {
+  if (std::isfinite(value)) {
+    return ToStr(value);
+  }
+  // The stream writes `inf` and `nan`, which are not JSON. Write them as the model JSON does.
+  std::string str;
+  Json::Dump(Json{JsonNumber{value}}, &str);
+  return str;
+}
+}  // namespace
+
+/**
+ * @brief Base class for dump model implementation.
  */
+template <typename TreeView>
 class TreeGenerator {
  protected:
-  static int32_t constexpr kFloatMaxPrecision =
-      std::numeric_limits<bst_float>::max_digits10;
   FeatureMap const& fmap_;
   std::stringstream ss_;
   bool const with_stats_;
-
-  template <typename Float>
-  static std::string ToStr(Float value) {
-    static_assert(std::is_floating_point<Float>::value,
-                  "Use std::to_string instead for non-floating point values.");
-    std::stringstream ss;
-    ss << std::setprecision(kFloatMaxPrecision) << value;
-    return ss.str();
-  }
 
   static std::string Tabs(uint32_t n) {
     std::string res;
@@ -56,11 +101,11 @@ class TreeGenerator {
     }
     return res;
   }
-  /* \brief Find the first occurance of key in input and replace it with corresponding
+  /* @brief Find the first occurrence of key in input and replace it with corresponding
    *        value.
    */
-  static std::string Match(std::string const& input,
-                           std::map<std::string, std::string> const& replacements) {
+  [[nodiscard]] static std::string Match(std::string const& input,
+                                         std::map<std::string, std::string> const& replacements) {
     std::string result = input;
     for (auto const& kv : replacements) {
       auto pos = result.find(kv.first);
@@ -70,67 +115,60 @@ class TreeGenerator {
     return result;
   }
 
-  virtual std::string Indicator(RegTree const& /*tree*/,
-                                int32_t /*nid*/, uint32_t /*depth*/) const {
+  virtual std::string Indicator(TreeView /*tree*/, int32_t /*nid*/, uint32_t /*depth*/) const {
     return "";
   }
-  virtual std::string Categorical(RegTree const&, int32_t, uint32_t) const = 0;
-  virtual std::string Integer(RegTree const& /*tree*/,
-                                int32_t /*nid*/, uint32_t /*depth*/) const {
+  virtual std::string Categorical(TreeView, int32_t, uint32_t) const = 0;
+  virtual std::string Integer(TreeView /*tree*/, int32_t /*nid*/, uint32_t /*depth*/) const {
     return "";
   }
-  virtual std::string Quantitive(RegTree const& /*tree*/,
-                                int32_t /*nid*/, uint32_t /*depth*/) const {
+  virtual std::string Quantitive(TreeView /*tree*/, int32_t /*nid*/, uint32_t /*depth*/) const {
     return "";
   }
-  virtual std::string NodeStat(RegTree const& /*tree*/, int32_t /*nid*/) const {
-    return "";
-  }
+  virtual std::string NodeStat(TreeView /*tree*/, int32_t /*nid*/) const { return ""; }
 
-  virtual std::string PlainNode(RegTree const& /*tree*/,
-                                int32_t /*nid*/, uint32_t /*depth*/) const = 0;
+  virtual std::string PlainNode(TreeView /*tree*/, int32_t /*nid*/, uint32_t /*depth*/) const = 0;
 
-  virtual std::string SplitNode(RegTree const& tree, int32_t nid, uint32_t depth) {
-    auto const split_index = tree[nid].SplitIndex();
+  virtual std::string SplitNode(TreeView tree, int32_t nid, uint32_t depth) {
+    auto const split_index = tree.SplitIndex(nid);
     std::string result;
-    auto is_categorical = tree.GetSplitTypes()[nid] == FeatureType::kCategorical;
+    auto is_categorical = tree.SplitType(nid) == FeatureType::kCategorical;
     if (split_index < fmap_.Size()) {
+      // Dispatch based on the feature map, check consistency between the fmap and the
+      // model.
       auto check_categorical = [&]() {
-        CHECK(is_categorical)
-            << fmap_.Name(split_index)
-            << " in feature map is numerical but tree node is categorical.";
+        CHECK(is_categorical) << fmap_.Name(split_index)
+                              << " in feature map is categorical but the tree node is numerical.";
       };
       auto check_numerical = [&]() {
         auto is_numerical = !is_categorical;
-        CHECK(is_numerical)
-            << fmap_.Name(split_index)
-            << " in feature map is categorical but tree node is numerical.";
+        CHECK(is_numerical) << fmap_.Name(split_index)
+                            << " in feature map is numerical but the tree node is categorical.";
       };
-
       switch (fmap_.TypeOf(split_index)) {
-      case FeatureMap::kCategorical: {
-        check_categorical();
-        result = this->Categorical(tree, nid, depth);
-        break;
-      }
-      case FeatureMap::kIndicator: {
-        check_numerical();
-        result = this->Indicator(tree, nid, depth);
-        break;
-      }
-      case FeatureMap::kInteger: {
-        check_numerical();
-        result = this->Integer(tree, nid, depth);
-        break;
-      }
-      case FeatureMap::kFloat:
-      case FeatureMap::kQuantitive: {
-        check_numerical();
-        result = this->Quantitive(tree, nid, depth);
-        break;
-      }
-      default:
-        LOG(FATAL) << "Unknown feature map type.";
+        case FeatureMap::kCategorical: {
+          check_categorical();
+          result = this->Categorical(tree, nid, depth);
+          break;
+        }
+        case FeatureMap::kIndicator: {
+          check_numerical();
+          result = this->Indicator(tree, nid, depth);
+          break;
+        }
+        case FeatureMap::kInteger: {
+          check_numerical();
+          result = this->Integer(tree, nid, depth);
+          break;
+        }
+        case FeatureMap::kFloat:
+        case FeatureMap::kQuantitive: {
+          check_numerical();
+          result = this->Quantitive(tree, nid, depth);
+          break;
+        }
+        default:
+          LOG(FATAL) << "Unknown feature map type.";
       }
     } else {
       if (is_categorical) {
@@ -142,76 +180,29 @@ class TreeGenerator {
     return result;
   }
 
-  virtual std::string LeafNode(RegTree const& tree, int32_t nid, uint32_t depth) const = 0;
-  virtual std::string BuildTree(RegTree const& tree, int32_t nid, uint32_t depth) = 0;
+  virtual std::string LeafNode(TreeView tree, int32_t nid, uint32_t depth) const = 0;
+  virtual std::string BuildTree(TreeView tree, int32_t nid, uint32_t depth) = 0;
 
  public:
-  TreeGenerator(FeatureMap const& _fmap, bool with_stats) :
-      fmap_{_fmap}, with_stats_{with_stats} {}
+  TreeGenerator(FeatureMap const& _fmap, bool with_stats) : fmap_{_fmap}, with_stats_{with_stats} {}
   virtual ~TreeGenerator() = default;
 
-  virtual void BuildTree(RegTree const& tree) {
-    ss_ << this->BuildTree(tree, 0, 0);
-  }
+  virtual void BuildTree(TreeView tree) { ss_ << this->BuildTree(tree, 0, 0); }
 
-  std::string Str() const {
-    return ss_.str();
-  }
-
-  static TreeGenerator* Create(std::string const& attrs, FeatureMap const& fmap,
-                               bool with_stats);
-};
-
-struct TreeGenReg : public dmlc::FunctionRegEntryBase<
-  TreeGenReg,
-  std::function<TreeGenerator* (
-      FeatureMap const& fmap, std::string attrs, bool with_stats)> > {
+  std::string Str() const { return ss_.str(); }
 };
 }  // namespace xgboost
 
-
-namespace dmlc {
-DMLC_REGISTRY_ENABLE(::xgboost::TreeGenReg);
-}  // namespace dmlc
-
 namespace xgboost {
-
-TreeGenerator* TreeGenerator::Create(std::string const& attrs, FeatureMap const& fmap,
-                                     bool with_stats) {
-  auto pos = attrs.find(':');
-  std::string name;
-  std::string params;
-  if (pos != std::string::npos) {
-    name = attrs.substr(0, pos);
-    params = attrs.substr(pos+1, attrs.length() - pos - 1);
-    // Eliminate all occurrences of single quote string.
-    size_t pos = std::string::npos;
-    while ((pos = params.find('\'')) != std::string::npos) {
-      params.replace(pos, 1, "\"");
-    }
-  } else {
-    name = attrs;
-  }
-  auto *e = ::dmlc::Registry< ::xgboost::TreeGenReg>::Get()->Find(name);
-  if (e == nullptr) {
-    LOG(FATAL) << "Unknown Model Builder:" << name;
-  }
-  auto p_io_builder = (e->body)(fmap, params, with_stats);
-  return p_io_builder;
-}
-
-#define XGBOOST_REGISTER_TREE_IO(UniqueId, Name)                        \
-  static DMLC_ATTRIBUTE_UNUSED ::xgboost::TreeGenReg&                   \
-  __make_ ## TreeGenReg ## _ ## UniqueId ## __ =                        \
-                  ::dmlc::Registry< ::xgboost::TreeGenReg>::Get()->__REGISTER__(Name)
-
-std::vector<bst_cat_t> GetSplitCategories(RegTree const &tree, int32_t nidx) {
-  auto const &csr = tree.GetCategoriesMatrix();
+namespace {
+template <typename TreeView>
+std::vector<bst_cat_t> GetSplitCategories(TreeView const& tree, int32_t nidx) {
+  auto const& csr = tree.GetCategoriesMatrix();
   auto seg = csr.node_ptr[nidx];
   auto split = common::KCatBitField{csr.categories.subspan(seg.beg, seg.size)};
 
   std::vector<bst_cat_t> cats;
-  for (size_t i = 0; i < split.Size(); ++i) {
+  for (size_t i = 0; i < split.Capacity(); ++i) {
     if (split.Check(i)) {
       cats.push_back(static_cast<bst_cat_t>(i));
     }
@@ -219,7 +210,7 @@ std::vector<bst_cat_t> GetSplitCategories(RegTree const &tree, int32_t nidx) {
   return cats;
 }
 
-std::string PrintCatsAsSet(std::vector<bst_cat_t> const &cats) {
+std::string PrintCatsAsSet(std::vector<bst_cat_t> const& cats) {
   std::stringstream ss;
   ss << "{";
   for (size_t i = 0; i < cats.size(); ++i) {
@@ -232,139 +223,129 @@ std::string PrintCatsAsSet(std::vector<bst_cat_t> const &cats) {
   return ss.str();
 }
 
-class TextGenerator : public TreeGenerator {
-  using SuperT = TreeGenerator;
+std::string GetFeatureName(FeatureMap const& fmap, bst_feature_t split_index) {
+  CHECK_LE(fmap.Size(), std::numeric_limits<decltype(split_index)>::max());
+  auto fname = split_index < static_cast<decltype(split_index)>(fmap.Size())
+                   ? fmap.Name(split_index)
+                   : ('f' + std::to_string(split_index));
+  return common::EscapeU8(fname);
+}
+}  // anonymous namespace
+
+template <typename TreeView>
+class TextGenerator : public TreeGenerator<TreeView> {
+  using SuperT = TreeGenerator<TreeView>;
 
  public:
-  TextGenerator(FeatureMap const& fmap, bool with_stats) :
-      TreeGenerator(fmap, with_stats) {}
+  TextGenerator(FeatureMap const& fmap, bool with_stats) : SuperT(fmap, with_stats) {}
 
-  std::string LeafNode(RegTree const& tree, int32_t nid, uint32_t depth) const override {
+  std::string LeafNode(TreeView tree, int32_t nid, uint32_t depth) const override {
     static std::string kLeafTemplate = "{tabs}{nid}:leaf={leaf}{stats}";
     static std::string kStatTemplate = ",cover={cover}";
     std::string result = SuperT::Match(
         kLeafTemplate,
-        {{"{tabs}",  SuperT::Tabs(depth)},
-         {"{nid}",   std::to_string(nid)},
-         {"{leaf}",  SuperT::ToStr(tree[nid].LeafValue())},
-         {"{stats}", with_stats_ ?
-          SuperT::Match(kStatTemplate,
-                        {{"{cover}", SuperT::ToStr(tree.Stat(nid).sum_hess)}}) : ""}});
+        {{"{tabs}", SuperT::Tabs(depth)},
+         {"{nid}", std::to_string(nid)},
+         {"{leaf}", ToStr(tree.LeafValue(nid))},
+         {"{stats}", SuperT::with_stats_
+                         ? SuperT::Match(kStatTemplate, {{"{cover}", ToStr(tree.SumHess(nid))}})
+                         : ""}});
     return result;
   }
 
-  std::string Indicator(RegTree const& tree, int32_t nid, uint32_t) const override {
+  std::string Indicator(TreeView tree, bst_node_t nid, uint32_t) const override {
     static std::string const kIndicatorTemplate = "{nid}:[{fname}] yes={yes},no={no}";
-    int32_t nyes = tree[nid].DefaultLeft() ?
-                   tree[nid].RightChild() : tree[nid].LeftChild();
-    auto split_index = tree[nid].SplitIndex();
-    std::string result = SuperT::Match(
-        kIndicatorTemplate,
-        {{"{nid}",   std::to_string(nid)},
-         {"{fname}", fmap_.Name(split_index)},
-         {"{yes}",   std::to_string(nyes)},
-         {"{no}",    std::to_string(tree[nid].DefaultChild())}});
+    int32_t nyes = tree.DefaultLeft(nid) ? tree.RightChild(nid) : tree.LeftChild(nid);
+    auto split_index = tree.SplitIndex(nid);
+    std::string result =
+        SuperT::Match(kIndicatorTemplate, {{"{nid}", std::to_string(nid)},
+                                           {"{fname}", GetFeatureName(SuperT::fmap_, split_index)},
+                                           {"{yes}", std::to_string(nyes)},
+                                           {"{no}", std::to_string(tree.DefaultChild(nid))}});
     return result;
   }
 
-  std::string SplitNodeImpl(
-      RegTree const& tree, int32_t nid, std::string const& template_str,
-      std::string cond, uint32_t depth) const {
-    auto split_index = tree[nid].SplitIndex();
-    std::string const result = SuperT::Match(
-        template_str,
-        {{"{tabs}",    SuperT::Tabs(depth)},
-         {"{nid}",     std::to_string(nid)},
-         {"{fname}",   split_index < fmap_.Size() ? fmap_.Name(split_index) :
-                                                    std::to_string(split_index)},
-         {"{cond}",    cond},
-         {"{left}",    std::to_string(tree[nid].LeftChild())},
-         {"{right}",   std::to_string(tree[nid].RightChild())},
-         {"{missing}", std::to_string(tree[nid].DefaultChild())}});
+  std::string SplitNodeImpl(TreeView tree, bst_node_t nid, std::string const& template_str,
+                            std::string cond, uint32_t depth) const {
+    auto split_index = tree.SplitIndex(nid);
+    std::string const result =
+        SuperT::Match(template_str, {{"{tabs}", SuperT::Tabs(depth)},
+                                     {"{nid}", std::to_string(nid)},
+                                     {"{fname}", GetFeatureName(SuperT::fmap_, split_index)},
+                                     {"{cond}", cond},
+                                     {"{left}", std::to_string(tree.LeftChild(nid))},
+                                     {"{right}", std::to_string(tree.RightChild(nid))},
+                                     {"{missing}", std::to_string(tree.DefaultChild(nid))}});
     return result;
   }
 
-  std::string Integer(RegTree const& tree, int32_t nid, uint32_t depth) const override {
+  std::string Integer(TreeView tree, int32_t nid, uint32_t depth) const override {
     static std::string const kIntegerTemplate =
         "{tabs}{nid}:[{fname}<{cond}] yes={left},no={right},missing={missing}";
-    auto cond = tree[nid].SplitCond();
+    auto cond = tree.SplitCond(nid);
     const bst_float floored = std::floor(cond);
-    const int32_t integer_threshold
-        = (floored == cond) ? static_cast<int>(floored)
-        : static_cast<int>(floored) + 1;
-    return SplitNodeImpl(tree, nid, kIntegerTemplate,
-                         std::to_string(integer_threshold), depth);
+    const int32_t integer_threshold =
+        (floored == cond) ? static_cast<int>(floored) : static_cast<int>(floored) + 1;
+    return SplitNodeImpl(tree, nid, kIntegerTemplate, std::to_string(integer_threshold), depth);
   }
 
-  std::string Quantitive(RegTree const& tree, int32_t nid, uint32_t depth) const override {
+  std::string Quantitive(TreeView tree, int32_t nid, uint32_t depth) const override {
     static std::string const kQuantitiveTemplate =
         "{tabs}{nid}:[{fname}<{cond}] yes={left},no={right},missing={missing}";
-    auto cond = tree[nid].SplitCond();
-    return SplitNodeImpl(tree, nid, kQuantitiveTemplate, SuperT::ToStr(cond), depth);
+    auto cond = tree.SplitCond(nid);
+    return SplitNodeImpl(tree, nid, kQuantitiveTemplate, ToStr(cond), depth);
   }
 
-  std::string PlainNode(RegTree const& tree, int32_t nid, uint32_t depth) const override {
-    auto cond = tree[nid].SplitCond();
+  std::string PlainNode(TreeView tree, int32_t nid, uint32_t depth) const override {
+    auto cond = tree.SplitCond(nid);
     static std::string const kNodeTemplate =
-        "{tabs}{nid}:[f{fname}<{cond}] yes={left},no={right},missing={missing}";
-    return SplitNodeImpl(tree, nid, kNodeTemplate, SuperT::ToStr(cond), depth);
+        "{tabs}{nid}:[{fname}<{cond}] yes={left},no={right},missing={missing}";
+    return SplitNodeImpl(tree, nid, kNodeTemplate, ToStr(cond), depth);
   }
 
-  std::string Categorical(RegTree const &tree, int32_t nid,
-                       uint32_t depth) const override {
+  std::string Categorical(TreeView tree, bst_node_t nid, uint32_t depth) const override {
     auto cats = GetSplitCategories(tree, nid);
     std::string cats_str = PrintCatsAsSet(cats);
     static std::string const kNodeTemplate =
         "{tabs}{nid}:[{fname}:{cond}] yes={right},no={left},missing={missing}";
-    std::string const result =
-        SplitNodeImpl(tree, nid, kNodeTemplate, cats_str, depth);
+    std::string const result = SplitNodeImpl(tree, nid, kNodeTemplate, cats_str, depth);
     return result;
   }
 
-  std::string NodeStat(RegTree const& tree, int32_t nid) const override {
+  std::string NodeStat(TreeView tree, bst_node_t nid) const override {
     static std::string const kStatTemplate = ",gain={loss_chg},cover={sum_hess}";
     std::string const result = SuperT::Match(
         kStatTemplate,
-        {{"{loss_chg}", SuperT::ToStr(tree.Stat(nid).loss_chg)},
-         {"{sum_hess}", SuperT::ToStr(tree.Stat(nid).sum_hess)}});
+        {{"{loss_chg}", ToStr(tree.LossChg(nid))}, {"{sum_hess}", ToStr(tree.SumHess(nid))}});
     return result;
   }
 
-  std::string BuildTree(RegTree const& tree, int32_t nid, uint32_t depth) override {
-    if (tree[nid].IsLeaf()) {
+  std::string BuildTree(TreeView tree, int32_t nid, uint32_t depth) override {
+    if (tree.IsLeaf(nid)) {
       return this->LeafNode(tree, nid, depth);
     }
     static std::string const kNodeTemplate = "{parent}{stat}\n{left}\n{right}";
     auto result = SuperT::Match(
-        kNodeTemplate,
-        {{"{parent}", this->SplitNode(tree, nid, depth)},
-         {"{stat}",   with_stats_ ? this->NodeStat(tree, nid) : ""},
-         {"{left}",   this->BuildTree(tree, tree[nid].LeftChild(), depth+1)},
-         {"{right}",  this->BuildTree(tree, tree[nid].RightChild(), depth+1)}});
+        kNodeTemplate, {{"{parent}", this->SplitNode(tree, nid, depth)},
+                        {"{stat}", SuperT::with_stats_ ? this->NodeStat(tree, nid) : ""},
+                        {"{left}", this->BuildTree(tree, tree.LeftChild(nid), depth + 1)},
+                        {"{right}", this->BuildTree(tree, tree.RightChild(nid), depth + 1)}});
     return result;
   }
 
-  void BuildTree(RegTree const& tree) override {
+  void BuildTree(TreeView tree) override {
     static std::string const& kTreeTemplate = "{nodes}\n";
-    auto result = SuperT::Match(
-        kTreeTemplate,
-        {{"{nodes}", this->BuildTree(tree, 0, 0)}});
-    ss_ << result;
+    auto result = SuperT::Match(kTreeTemplate, {{"{nodes}", this->BuildTree(tree, 0, 0)}});
+    SuperT::ss_ << result;
   }
 };
 
-XGBOOST_REGISTER_TREE_IO(TextGenerator, "text")
-.describe("Dump text representation of tree")
-.set_body([](FeatureMap const& fmap, std::string const& attrs, bool with_stats) {
-            return new TextGenerator(fmap, with_stats);
-          });
-
-class JsonGenerator : public TreeGenerator {
-  using SuperT = TreeGenerator;
+template <typename TreeView>
+class JsonGenerator : public TreeGenerator<TreeView> {
+  using SuperT = TreeGenerator<TreeView>;
 
  public:
-  JsonGenerator(FeatureMap const& fmap, bool with_stats) :
-      TreeGenerator(fmap, with_stats) {}
+  JsonGenerator(FeatureMap const& fmap, bool with_stats) : SuperT{fmap, with_stats} {}
 
   std::string Indent(uint32_t depth) const {
     std::string result;
@@ -374,39 +355,34 @@ class JsonGenerator : public TreeGenerator {
     return result;
   }
 
-  std::string LeafNode(RegTree const& tree, int32_t nid, uint32_t) const override {
-    static std::string const kLeafTemplate =
-        R"L({ "nodeid": {nid}, "leaf": {leaf} {stat}})L";
-    static std::string const kStatTemplate =
-        R"S(, "cover": {sum_hess} )S";
+  std::string LeafNode(TreeView tree, bst_node_t nid, uint32_t) const override {
+    static std::string const kLeafTemplate = R"L({ "nodeid": {nid}, "leaf": {leaf} {stat}})L";
+    static std::string const kStatTemplate = R"S(, "cover": {sum_hess} )S";
     std::string result = SuperT::Match(
         kLeafTemplate,
-        {{"{nid}",  std::to_string(nid)},
-         {"{leaf}", SuperT::ToStr(tree[nid].LeafValue())},
-         {"{stat}", with_stats_ ? SuperT::Match(
-             kStatTemplate,
-             {{"{sum_hess}",
-               SuperT::ToStr(tree.Stat(nid).sum_hess)}})  : ""}});
+        {{"{nid}", std::to_string(nid)},
+         {"{leaf}", ToStr(tree.LeafValue(nid), NoTruncate())},
+         {"{stat}", SuperT::with_stats_
+                        ? SuperT::Match(kStatTemplate, {{"{sum_hess}", ToStr(tree.SumHess(nid))}})
+                        : ""}});
     return result;
   }
 
-  std::string Indicator(RegTree const& tree, int32_t nid, uint32_t depth) const override {
-    int32_t nyes = tree[nid].DefaultLeft() ?
-                   tree[nid].RightChild() : tree[nid].LeftChild();
+  std::string Indicator(TreeView tree, bst_node_t nid, uint32_t depth) const override {
+    int32_t nyes = tree.DefaultLeft(nid) ? tree.RightChild(nid) : tree.LeftChild(nid);
     static std::string const kIndicatorTemplate =
         R"ID( "nodeid": {nid}, "depth": {depth}, "split": "{fname}", "yes": {yes}, "no": {no})ID";
-    auto split_index = tree[nid].SplitIndex();
-    auto result = SuperT::Match(
-        kIndicatorTemplate,
-        {{"{nid}",   std::to_string(nid)},
-         {"{depth}", std::to_string(depth)},
-         {"{fname}", fmap_.Name(split_index)},
-         {"{yes}",   std::to_string(nyes)},
-         {"{no}",    std::to_string(tree[nid].DefaultChild())}});
+    auto split_index = tree.SplitIndex(nid);
+    auto result =
+        SuperT::Match(kIndicatorTemplate, {{"{nid}", std::to_string(nid)},
+                                           {"{depth}", std::to_string(depth)},
+                                           {"{fname}", GetFeatureName(SuperT::fmap_, split_index)},
+                                           {"{yes}", std::to_string(nyes)},
+                                           {"{no}", std::to_string(tree.DefaultChild(nid))}});
     return result;
   }
 
-  std::string Categorical(RegTree const& tree, int32_t nid, uint32_t depth) const override {
+  std::string Categorical(TreeView tree, bst_node_t nid, uint32_t depth) const override {
     auto cats = GetSplitCategories(tree, nid);
     static std::string const kCategoryTemplate =
         R"I( "nodeid": {nid}, "depth": {depth}, "split": "{fname}", )I"
@@ -424,96 +400,83 @@ class JsonGenerator : public TreeGenerator {
     return results;
   }
 
-  std::string SplitNodeImpl(RegTree const &tree, int32_t nid,
-                            std::string const &template_str, std::string cond,
-                            uint32_t depth) const {
-    auto split_index = tree[nid].SplitIndex();
-    std::string const result = SuperT::Match(
-        template_str,
-        {{"{nid}",     std::to_string(nid)},
-         {"{depth}",   std::to_string(depth)},
-         {"{fname}",   split_index < fmap_.Size() ? fmap_.Name(split_index) :
-                                                    std::to_string(split_index)},
-         {"{cond}",    cond},
-         {"{left}",    std::to_string(tree[nid].LeftChild())},
-         {"{right}",   std::to_string(tree[nid].RightChild())},
-         {"{missing}", std::to_string(tree[nid].DefaultChild())}});
+  std::string SplitNodeImpl(TreeView tree, bst_node_t nid, std::string const& template_str,
+                            std::string cond, uint32_t depth) const {
+    auto split_index = tree.SplitIndex(nid);
+    std::string const result =
+        SuperT::Match(template_str, {{"{nid}", std::to_string(nid)},
+                                     {"{depth}", std::to_string(depth)},
+                                     {"{fname}", GetFeatureName(SuperT::fmap_, split_index)},
+                                     {"{cond}", cond},
+                                     {"{left}", std::to_string(tree.LeftChild(nid))},
+                                     {"{right}", std::to_string(tree.RightChild(nid))},
+                                     {"{missing}", std::to_string(tree.DefaultChild(nid))}});
     return result;
   }
 
-  std::string Integer(RegTree const& tree, int32_t nid, uint32_t depth) const override {
-    auto cond = tree[nid].SplitCond();
+  std::string Integer(TreeView tree, int32_t nid, uint32_t depth) const override {
+    auto cond = tree.SplitCond(nid);
+    if (!std::isfinite(cond)) {
+      return this->Quantitive(tree, nid, depth);  // No integer form, write it as a float.
+    }
     const bst_float floored = std::floor(cond);
-    const int32_t integer_threshold
-        = (floored == cond) ? static_cast<int32_t>(floored)
-        : static_cast<int32_t>(floored) + 1;
+    const int32_t integer_threshold =
+        (floored == cond) ? static_cast<int32_t>(floored) : static_cast<int32_t>(floored) + 1;
     static std::string const kIntegerTemplate =
         R"I( "nodeid": {nid}, "depth": {depth}, "split": "{fname}", )I"
         R"I("split_condition": {cond}, "yes": {left}, "no": {right}, )I"
         R"I("missing": {missing})I";
-    return SplitNodeImpl(tree, nid, kIntegerTemplate,
-                         std::to_string(integer_threshold), depth);
+    return SplitNodeImpl(tree, nid, kIntegerTemplate, std::to_string(integer_threshold), depth);
   }
 
-  std::string Quantitive(RegTree const& tree, int32_t nid, uint32_t depth) const override {
+  std::string Quantitive(TreeView tree, int32_t nid, uint32_t depth) const override {
     static std::string const kQuantitiveTemplate =
         R"I( "nodeid": {nid}, "depth": {depth}, "split": "{fname}", )I"
         R"I("split_condition": {cond}, "yes": {left}, "no": {right}, )I"
         R"I("missing": {missing})I";
-    bst_float cond = tree[nid].SplitCond();
-    return SplitNodeImpl(tree, nid, kQuantitiveTemplate, SuperT::ToStr(cond), depth);
+    bst_float cond = tree.SplitCond(nid);
+    return SplitNodeImpl(tree, nid, kQuantitiveTemplate, ToJsonStr(cond), depth);
   }
 
-  std::string PlainNode(RegTree const& tree, int32_t nid, uint32_t depth) const override {
-    auto cond = tree[nid].SplitCond();
+  std::string PlainNode(TreeView tree, int32_t nid, uint32_t depth) const override {
+    auto cond = tree.SplitCond(nid);
     static std::string const kNodeTemplate =
         R"I( "nodeid": {nid}, "depth": {depth}, "split": "{fname}", )I"
         R"I("split_condition": {cond}, "yes": {left}, "no": {right}, )I"
         R"I("missing": {missing})I";
-    return SplitNodeImpl(tree, nid, kNodeTemplate, SuperT::ToStr(cond), depth);
+    return SplitNodeImpl(tree, nid, kNodeTemplate, ToJsonStr(cond), depth);
   }
 
-  std::string NodeStat(RegTree const& tree, int32_t nid) const override {
-    static std::string kStatTemplate =
-        R"S(, "gain": {loss_chg}, "cover": {sum_hess})S";
-    auto result = SuperT::Match(
-        kStatTemplate,
-        {{"{loss_chg}", SuperT::ToStr(tree.Stat(nid).loss_chg)},
-         {"{sum_hess}", SuperT::ToStr(tree.Stat(nid).sum_hess)}});
+  std::string NodeStat(TreeView tree, int32_t nid) const override {
+    static std::string kStatTemplate = R"S(, "gain": {loss_chg}, "cover": {sum_hess})S";
+    auto result = SuperT::Match(kStatTemplate, {{"{loss_chg}", ToStr(tree.LossChg(nid))},
+                                                {"{sum_hess}", ToStr(tree.SumHess(nid))}});
     return result;
   }
 
-  std::string SplitNode(RegTree const& tree, int32_t nid, uint32_t depth) override {
+  std::string SplitNode(TreeView tree, int32_t nid, uint32_t depth) override {
     std::string properties = SuperT::SplitNode(tree, nid, depth);
     static std::string const kSplitNodeTemplate =
         "{{properties} {stat}, \"children\": [{left}, {right}\n{indent}]}";
     auto result = SuperT::Match(
-        kSplitNodeTemplate,
-        {{"{properties}", properties},
-         {"{stat}",   with_stats_ ? this->NodeStat(tree, nid) : ""},
-         {"{left}",   this->BuildTree(tree, tree[nid].LeftChild(), depth+1)},
-         {"{right}",  this->BuildTree(tree, tree[nid].RightChild(), depth+1)},
-         {"{indent}", this->Indent(depth)}});
+        kSplitNodeTemplate, {{"{properties}", properties},
+                             {"{stat}", SuperT::with_stats_ ? this->NodeStat(tree, nid) : ""},
+                             {"{left}", this->BuildTree(tree, tree.LeftChild(nid), depth + 1)},
+                             {"{right}", this->BuildTree(tree, tree.RightChild(nid), depth + 1)},
+                             {"{indent}", this->Indent(depth)}});
     return result;
   }
 
-  std::string BuildTree(RegTree const& tree, int32_t nid, uint32_t depth) override {
+  std::string BuildTree(TreeView tree, int32_t nid, uint32_t depth) override {
     static std::string const kNodeTemplate = "{newline}{indent}{nodes}";
     auto result = SuperT::Match(
-        kNodeTemplate,
-        {{"{newline}", depth == 0 ? "" : "\n"},
-         {"{indent}", Indent(depth)},
-         {"{nodes}",  tree[nid].IsLeaf() ? this->LeafNode(tree, nid, depth) :
-                                           this->SplitNode(tree, nid, depth)}});
+        kNodeTemplate, {{"{newline}", depth == 0 ? "" : "\n"},
+                        {"{indent}", Indent(depth)},
+                        {"{nodes}", tree.IsLeaf(nid) ? this->LeafNode(tree, nid, depth)
+                                                     : this->SplitNode(tree, nid, depth)}});
     return result;
   }
 };
-
-XGBOOST_REGISTER_TREE_IO(JsonGenerator, "json")
-.describe("Dump json representation of tree")
-.set_body([](FeatureMap const& fmap, std::string const& attrs, bool with_stats) {
-            return new JsonGenerator(fmap, with_stats);
-          });
 
 struct GraphvizParam : public XGBoostParameter<GraphvizParam> {
   std::string yes_color;
@@ -523,22 +486,16 @@ struct GraphvizParam : public XGBoostParameter<GraphvizParam> {
   std::string leaf_node_params;
   std::string graph_attrs;
 
-  DMLC_DECLARE_PARAMETER(GraphvizParam){
-    DMLC_DECLARE_FIELD(yes_color)
-        .set_default("#0000FF")
-        .describe("Edge color when meets the node condition.");
-    DMLC_DECLARE_FIELD(no_color)
-        .set_default("#FF0000")
-        .describe("Edge color when doesn't meet the node condition.");
-    DMLC_DECLARE_FIELD(rankdir)
-        .set_default("TB")
-        .describe("Passed to graphiz via graph_attr.");
+  DMLC_DECLARE_PARAMETER(GraphvizParam) {
+    DMLC_DECLARE_FIELD(yes_color).set_default("#0000FF").describe(
+        "Edge color when meets the node condition.");
+    DMLC_DECLARE_FIELD(no_color).set_default("#FF0000").describe(
+        "Edge color when doesn't meet the node condition.");
+    DMLC_DECLARE_FIELD(rankdir).set_default("TB").describe("Passed to graphiz via graph_attr.");
     DMLC_DECLARE_FIELD(condition_node_params)
         .set_default("")
         .describe("Conditional node configuration");
-    DMLC_DECLARE_FIELD(leaf_node_params)
-        .set_default("")
-        .describe("Leaf node configuration");
+    DMLC_DECLARE_FIELD(leaf_node_params).set_default("").describe("Leaf node configuration");
     DMLC_DECLARE_FIELD(graph_attrs)
         .set_default("")
         .describe("Any other extra attributes for graphviz `graph_attr`.");
@@ -547,13 +504,14 @@ struct GraphvizParam : public XGBoostParameter<GraphvizParam> {
 
 DMLC_REGISTER_PARAMETER(GraphvizParam);
 
-class GraphvizGenerator : public TreeGenerator {
-  using SuperT = TreeGenerator;
+template <typename TreeView>
+class GraphvizGenerator : public TreeGenerator<TreeView> {
+  using SuperT = TreeGenerator<TreeView>;
   GraphvizParam param_;
 
  public:
-  GraphvizGenerator(FeatureMap const& fmap, std::string const& attrs, bool with_stats) :
-      TreeGenerator(fmap, with_stats) {
+  GraphvizGenerator(FeatureMap const& fmap, std::string const& attrs, bool with_stats)
+      : SuperT{fmap, with_stats} {
     param_.UpdateAllowUnknown(std::map<std::string, std::string>{});
     using KwArg = std::map<std::string, std::map<std::string, std::string>>;
     KwArg kwargs;
@@ -562,9 +520,8 @@ class GraphvizGenerator : public TreeGenerator {
       try {
         dmlc::JSONReader reader(&iss);
         reader.Read(&kwargs);
-      } catch(dmlc::Error const& e) {
-        LOG(FATAL) << "Failed to parse graphviz parameters:\n\t"
-                   << attrs << "\n"
+      } catch (dmlc::Error const& e) {
+        LOG(FATAL) << "Failed to parse graphviz parameters:\n\t" << attrs << "\n"
                    << "With error:\n"
                    << e.what();
       }
@@ -598,9 +555,8 @@ class GraphvizGenerator : public TreeGenerator {
     auto const& extra = kwargs["graph_attrs"];
     static std::string const kGraphTemplate = "    graph [ {key}=\"{value}\" ]\n";
     for (auto const& kv : extra) {
-      param_.graph_attrs += SuperT::Match(kGraphTemplate,
-                                     {{"{key}", kv.first},
-                                      {"{value}", kv.second}});
+      param_.graph_attrs +=
+          SuperT::Match(kGraphTemplate, {{"{key}", kv.first}, {"{value}", kv.second}});
     }
 
     kwargs.erase("graph_attrs");
@@ -616,11 +572,11 @@ class GraphvizGenerator : public TreeGenerator {
 
  protected:
   template <bool is_categorical>
-  std::string BuildEdge(RegTree const &tree, bst_node_t nid, int32_t child, bool left) const {
+  std::string BuildEdge(TreeView tree, bst_node_t nidx, int32_t child, bool left) const {
     static std::string const kEdgeTemplate =
         "    {nid} -> {child} [label=\"{branch}\" color=\"{color}\"]\n";
     // Is this the default child for missing value?
-    bool is_missing = tree[nid].DefaultChild() == child;
+    bool is_missing = tree.DefaultChild(nidx) == child;
     std::string branch;
     if (is_categorical) {
       branch = std::string{left ? "no" : "yes"} + std::string{is_missing ? ", missing" : ""};
@@ -628,292 +584,445 @@ class GraphvizGenerator : public TreeGenerator {
       branch = std::string{left ? "yes" : "no"} + std::string{is_missing ? ", missing" : ""};
     }
     std::string buffer =
-        SuperT::Match(kEdgeTemplate,
-                {{"{nid}", std::to_string(nid)},
-                 {"{child}", std::to_string(child)},
-                 {"{color}", is_missing ? param_.yes_color : param_.no_color},
-                 {"{branch}", branch}});
+        SuperT::Match(kEdgeTemplate, {{"{nid}", std::to_string(nidx)},
+                                      {"{child}", std::to_string(child)},
+                                      {"{color}", is_missing ? param_.yes_color : param_.no_color},
+                                      {"{branch}", branch}});
     return buffer;
   }
 
   // Only indicator is different, so we combine all different node types into this
   // function.
-  std::string PlainNode(RegTree const& tree, int32_t nid, uint32_t) const override {
-    auto split = tree[nid].SplitIndex();
-    auto cond = tree[nid].SplitCond();
+  std::string PlainNode(TreeView tree, bst_node_t nidx, uint32_t) const override {
+    auto split_index = tree.SplitIndex(nidx);
+    auto cond = tree.SplitCond(nidx);
     static std::string const kNodeTemplate =
-        "    {nid} [ label=\"{fname}{<}{cond}\" {params}]\n";
+        "    {nid} [ label=\"{fname}{<}{cond}{stat}\" {params}]\n";
 
-    // Indicator only has fname.
-    bool has_less = (split >= fmap_.Size()) || fmap_.TypeOf(split) != FeatureMap::kIndicator;
-    std::string result = SuperT::Match(kNodeTemplate, {
-        {"{nid}",    std::to_string(nid)},
-        {"{fname}",  split < fmap_.Size() ? fmap_.Name(split) :
-                                           'f' + std::to_string(split)},
-        {"{<}",      has_less ? "<" : ""},
-        {"{cond}",   has_less ? SuperT::ToStr(cond) : ""},
-        {"{params}", param_.condition_node_params}});
+    bool has_less = (split_index >= SuperT::fmap_.Size()) ||
+                    SuperT::fmap_.TypeOf(split_index) != FeatureMap::kIndicator;
+    std::string result = SuperT::Match(
+        kNodeTemplate, {{"{nid}", std::to_string(nidx)},
+                        {"{fname}", GetFeatureName(SuperT::fmap_, split_index)},
+                        {"{<}", has_less ? "<" : ""},
+                        {"{cond}", has_less ? ToStr(cond) : ""},
+                        {"{stat}", this->with_stats_ ? this->NodeStat(tree, nidx) : ""},
+                        {"{params}", param_.condition_node_params}});
 
-    result += BuildEdge<false>(tree, nid, tree[nid].LeftChild(), true);
-    result += BuildEdge<false>(tree, nid, tree[nid].RightChild(), false);
+    result += BuildEdge<false>(tree, nidx, tree.LeftChild(nidx), true);
+    result += BuildEdge<false>(tree, nidx, tree.RightChild(nidx), false);
 
     return result;
   };
 
-  std::string Categorical(RegTree const& tree, int32_t nid, uint32_t) const override {
-    static std::string const kLabelTemplate =
-        "    {nid} [ label=\"{fname}:{cond}\" {params}]\n";
-    auto cats = GetSplitCategories(tree, nid);
-    auto cats_str = PrintCatsAsSet(cats);
-    auto split = tree[nid].SplitIndex();
-    std::string result = SuperT::Match(
-        kLabelTemplate,
-        {{"{nid}", std::to_string(nid)},
-         {"{fname}", split < fmap_.Size() ? fmap_.Name(split)
-                                          : 'f' + std::to_string(split)},
-         {"{cond}", cats_str},
-         {"{params}", param_.condition_node_params}});
+  std::string NodeStat(TreeView tree, bst_node_t nidx) const override {
+    return SuperT::Match("\ngain={gain}\ncover={cover}", {{"{cover}", ToStr(tree.SumHess(nidx))},
+                                                          {"{gain}", ToStr(tree.LossChg(nidx))}});
+  }
 
-    result += BuildEdge<true>(tree, nid, tree[nid].LeftChild(), true);
-    result += BuildEdge<true>(tree, nid, tree[nid].RightChild(), false);
+  std::string Categorical(TreeView tree, bst_node_t nidx, uint32_t /*depth*/) const override {
+    static std::string const kLabelTemplate =
+        "    {nid} [ label=\"{fname}:{cond}{stat}\" {params}]\n";
+    auto cats = GetSplitCategories(tree, nidx);
+    auto cats_str = PrintCatsAsSet(cats);
+    auto split_index = tree.SplitIndex(nidx);
+
+    std::string result = SuperT::Match(
+        kLabelTemplate, {{"{nid}", std::to_string(nidx)},
+                         {"{fname}", GetFeatureName(SuperT::fmap_, split_index)},
+                         {"{cond}", cats_str},
+                         {"{stat}", this->with_stats_ ? this->NodeStat(tree, nidx) : ""},
+                         {"{params}", param_.condition_node_params}});
+
+    result += BuildEdge<true>(tree, nidx, tree.LeftChild(nidx), true);
+    result += BuildEdge<true>(tree, nidx, tree.RightChild(nidx), false);
 
     return result;
   }
 
-  std::string LeafNode(RegTree const& tree, int32_t nid, uint32_t) const override {
+  std::string LeafNode(TreeView tree, bst_node_t nidx, uint32_t) const override {
+    static std::string const kCoverTemplate = "\ncover={cover}";
     static std::string const kLeafTemplate =
-        "    {nid} [ label=\"leaf={leaf-value}\" {params}]\n";
-    auto result = SuperT::Match(kLeafTemplate, {
-        {"{nid}",        std::to_string(nid)},
-        {"{leaf-value}", ToStr(tree[nid].LeafValue())},
-        {"{params}",     param_.leaf_node_params}});
-    return result;
-  };
+        "    {nid} [ label=\"leaf={leaf-value}{cover}\" {params}]\n";
+    auto value = tree.LeafValue(nidx);
+    return SuperT::Match(
+        kLeafTemplate,
+        {{"{nid}", std::to_string(nidx)},
+         {"{leaf-value}", ToStr(value)},
+         {"{cover}", this->with_stats_
+                         ? SuperT::Match(kCoverTemplate, {{"{cover}", ToStr(tree.SumHess(nidx))}})
+                         : ""},
+         {"{params}", param_.leaf_node_params}});
+  }
 
-  std::string BuildTree(RegTree const& tree, int32_t nid, uint32_t depth) override {
-    if (tree[nid].IsLeaf()) {
-      return this->LeafNode(tree, nid, depth);
+  std::string BuildTree(TreeView tree, bst_node_t nidx, uint32_t depth) override {
+    if (tree.IsLeaf(nidx)) {
+      return this->LeafNode(tree, nidx, depth);
     }
     static std::string const kNodeTemplate = "{parent}\n{left}\n{right}";
-    auto node = tree.GetSplitTypes()[nid] == FeatureType::kCategorical
-                    ? this->Categorical(tree, nid, depth)
-                    : this->PlainNode(tree, nid, depth);
+    auto node = tree.SplitType(nidx) == FeatureType::kCategorical
+                    ? this->Categorical(tree, nidx, depth)
+                    : this->PlainNode(tree, nidx, depth);
     auto result = SuperT::Match(
-        kNodeTemplate,
-        {{"{parent}", node},
-         {"{left}",   this->BuildTree(tree, tree[nid].LeftChild(), depth+1)},
-         {"{right}",  this->BuildTree(tree, tree[nid].RightChild(), depth+1)}});
+        kNodeTemplate, {{"{parent}", node},
+                        {"{left}", this->BuildTree(tree, tree.LeftChild(nidx), depth + 1)},
+                        {"{right}", this->BuildTree(tree, tree.RightChild(nidx), depth + 1)}});
     return result;
   }
 
-  void BuildTree(RegTree const& tree) override {
+  void BuildTree(TreeView tree) override {
     static std::string const kTreeTemplate =
         "digraph {\n"
         "    graph [ rankdir={rankdir} ]\n"
         "{graph_attrs}\n"
         "{nodes}}";
-    auto result = SuperT::Match(
-        kTreeTemplate,
-        {{"{rankdir}",     param_.rankdir},
-         {"{graph_attrs}", param_.graph_attrs},
-         {"{nodes}",       this->BuildTree(tree, 0, 0)}});
-    ss_ << result;
+    auto result = SuperT::Match(kTreeTemplate, {{"{rankdir}", param_.rankdir},
+                                                {"{graph_attrs}", param_.graph_attrs},
+                                                {"{nodes}", this->BuildTree(tree, 0, 0)}});
+    SuperT::ss_ << result;
   };
 };
 
-XGBOOST_REGISTER_TREE_IO(GraphvizGenerator, "dot")
-.describe("Dump graphviz representation of tree")
-.set_body([](FeatureMap const& fmap, std::string attrs, bool with_stats) {
-            return new GraphvizGenerator(fmap, attrs, with_stats);
-          });
-
 constexpr bst_node_t RegTree::kRoot;
 
-std::string RegTree::DumpModel(const FeatureMap& fmap,
-                               bool with_stats,
-                               std::string format) const {
-  std::unique_ptr<TreeGenerator> builder {
-    TreeGenerator::Create(format, fmap, with_stats)
-  };
-  builder->BuildTree(*this);
-
-  std::string result = builder->Str();
-  return result;
+void TreeParam::FromJson(Json const& in) {
+  auto const& obj = get<Object const>(in);
+  auto n_deleted_it = obj.find(StringView{"num_deleted"});
+  if (n_deleted_it != obj.cend()) {
+    // Missing in 1.0 models.
+    this->num_deleted = std::stoi(get<String const>(n_deleted_it->second));
+  }
+  this->num_feature = std::stoul(get<String const>(obj.at("num_feature")));
+  this->num_nodes = std::stoi(get<String const>(obj.at("num_nodes")));
+  this->size_leaf_vector = std::stoul(get<String const>(obj.at("size_leaf_vector")));
 }
 
-bool RegTree::Equal(const RegTree& b) const {
-  if (NumExtraNodes() != b.NumExtraNodes()) {
+void TreeParam::ToJson(Json* p_out) const {
+  auto& out = *p_out;
+  out["num_deleted"] = std::to_string(this->num_deleted);
+  out["num_feature"] = std::to_string(this->num_feature);
+  out["num_nodes"] = std::to_string(this->num_nodes);
+  out["size_leaf_vector"] = std::to_string(this->size_leaf_vector);
+}
+
+template <typename TreeView>
+std::unique_ptr<TreeGenerator<TreeView>> CreateTreeGenerator(std::string const& attrs,
+                                                             FeatureMap const& fmap,
+                                                             bool with_stats) {
+  auto pos = attrs.find(':');
+  std::string name;
+  std::string params;
+  if (pos != std::string::npos) {
+    name = attrs.substr(0, pos);
+    params = attrs.substr(pos + 1, attrs.length() - pos - 1);
+    // Eliminate all occurrences of single quote string.
+    size_t pos = std::string::npos;
+    while ((pos = params.find('\'')) != std::string::npos) {
+      params.replace(pos, 1, "\"");
+    }
+  } else {
+    name = attrs;
+  }
+  std::unique_ptr<TreeGenerator<TreeView>> ptr;
+  if (name == "dot") {
+    return std::make_unique<GraphvizGenerator<TreeView>>(fmap, params, with_stats);
+  } else if (name == "text") {
+    return std::make_unique<TextGenerator<TreeView>>(fmap, with_stats);
+  } else if (name == "json") {
+    return std::make_unique<JsonGenerator<TreeView>>(fmap, with_stats);
+  } else {
+    LOG(FATAL) << "Unknown Model Builder:" << name;
+  }
+  return {nullptr};
+}
+
+std::string RegTree::DumpModel(const FeatureMap& fmap, bool with_stats, std::string format) const {
+  auto impl = [](auto builder, auto view) {
+    builder->BuildTree(view);
+    std::string result = builder->Str();
+    return result;
+  };
+  if (this->IsMultiTarget()) {
+    return impl(CreateTreeGenerator<tree::MultiTargetTreeView>(format, fmap, with_stats),
+                this->HostMtView());
+  } else {
+    return impl(CreateTreeGenerator<tree::ScalarTreeView>(format, fmap, with_stats),
+                this->HostScView());
+  }
+}
+
+[[nodiscard]] bool RegTree::Equal(RegTree const& b) const {
+  if (this->NumTargets() != b.NumTargets()) {
     return false;
   }
+  if (this->HasCategoricalSplit() != b.HasCategoricalSplit()) {
+    return false;
+  }
+  if (this->NumExtraNodes() != b.NumExtraNodes()) {
+    return false;
+  }
+  if (this->Size() != b.Size()) {
+    return false;
+  }
+  if (this->HasCategoricalSplit()) {
+    auto device = DeviceOrd::CPU();
+    auto res = [&] {
+      using Seg = CategoricalSplitMatrix::Segment;
+      auto l_ptr = this->GetSplitCategoriesPtr();
+      auto r_ptr = b.GetSplitCategoriesPtr();
+      return l_ptr.size() == r_ptr.size() &&
+             std::equal(
+                 l_ptr.cbegin(), l_ptr.cend(), r_ptr.cbegin(),
+                 [](Seg const& l, Seg const& r) { return l.size == r.size && l.beg == r.beg; });
+    }() && [&] {
+      auto l_typ = this->GetSplitTypes(device);
+      auto r_typ = b.GetSplitTypes(device);
+      return l_typ.size() == r_typ.size() &&
+             std::equal(l_typ.cbegin(), l_typ.cend(), r_typ.cbegin());
+    }() && [&] {
+      auto l_cats = this->GetSplitCategories(device);
+      auto r_cats = b.GetSplitCategories(device);
+      return l_cats.size() == r_cats.size() &&
+             std::equal(l_cats.cbegin(), l_cats.cend(), r_cats.cbegin());
+    }();
+    if (!res) {
+      return res;
+    }
+  }
   auto const& self = *this;
-  bool ret { true };
-  this->WalkTree([&self, &b, &ret](bst_node_t nidx) {
-    if (!(self.nodes_.at(nidx) == b.nodes_.at(nidx))) {
-      ret = false;
-      return false;
+  auto n_targets = self.NumTargets();
+
+  auto float_eq = [](float l, float r) {
+    return std::abs(l - r) < kRtEps;
+  };
+  auto leaf_same = [=](auto lhs, auto rhs, bst_node_t nidx) {
+    if constexpr (tree::IsScalarTree(lhs)) {
+      return float_eq(lhs.LeafValue(nidx), rhs.LeafValue(nidx));
+    } else {
+      auto l_leaf = lhs.LeafValue(nidx);
+      auto r_leaf = rhs.LeafValue(nidx);
+      for (decltype(n_targets) t = 0; t < n_targets; ++t) {
+        if (!float_eq(l_leaf(t), r_leaf(t))) {
+          return false;
+        }
+      }
+      return true;
+    }
+  };
+  bool equal = false;
+  tree::WalkTree(
+      *this,
+      [&](auto const& lhs, auto const& rhs, bst_node_t nidx) {
+        auto res = lhs.LeftChild(nidx) == rhs.LeftChild(nidx) &&
+                   lhs.RightChild(nidx) == rhs.RightChild(nidx) &&
+                   lhs.SplitIndex(nidx) == rhs.SplitIndex(nidx) &&
+                   lhs.DefaultLeft(nidx) == rhs.DefaultLeft(nidx) &&
+                   (!this->HasCategoricalSplit() || lhs.SplitType(nidx) == rhs.SplitType(nidx)) &&
+                   lhs.IsLeaf(nidx) == rhs.IsLeaf(nidx) &&
+                   (lhs.IsLeaf(nidx) ? leaf_same(lhs, rhs, nidx)
+                                     : float_eq(lhs.SplitCond(nidx), rhs.SplitCond(nidx)));
+        equal = res;
+        // Stop if two trees are not equal.
+        return res;
+      },
+      b);
+  return equal;
+}
+
+[[nodiscard]] bst_node_t RegTree::GetNumLeaves() const {
+  bst_node_t leaves{0};
+  tree::WalkTree(*this, [&leaves](auto const& tree, bst_node_t nidx) {
+    if (tree.IsLeaf(nidx)) {
+      leaves++;
     }
     return true;
   });
-  return ret;
-}
-
-bst_node_t RegTree::GetNumLeaves() const {
-  bst_node_t leaves { 0 };
-  auto const& self = *this;
-  this->WalkTree([&leaves, &self](bst_node_t nidx) {
-                   if (self[nidx].IsLeaf()) {
-                     leaves++;
-                   }
-                   return true;
-                 });
   return leaves;
 }
 
-bst_node_t RegTree::GetNumSplitNodes() const {
-  bst_node_t splits { 0 };
-  auto const& self = *this;
-  this->WalkTree([&splits, &self](bst_node_t nidx) {
-                   if (!self[nidx].IsLeaf()) {
-                     splits++;
-                   }
-                   return true;
-                 });
+[[nodiscard]] bst_node_t RegTree::GetNumSplitNodes() const {
+  bst_node_t splits{0};
+  tree::WalkTree(*this, [&splits](auto const& tree, bst_node_t nidx) {
+    if (!tree.IsLeaf(nidx)) {
+      splits++;
+    }
+    return true;
+  });
   return splits;
 }
 
-void RegTree::ExpandNode(bst_node_t nid, unsigned split_index, bst_float split_value,
-                         bool default_left, bst_float base_weight,
-                         bst_float left_leaf_weight,
-                         bst_float right_leaf_weight, bst_float loss_change,
-                         float sum_hess, float left_sum, float right_sum,
-                         bst_node_t leaf_right_child) {
-  int pleft = this->AllocNode();
-  int pright = this->AllocNode();
-  auto &node = nodes_[nid];
-  CHECK(node.IsLeaf());
-  node.SetLeftChild(pleft);
-  node.SetRightChild(pright);
-  nodes_[node.LeftChild()].SetParent(nid, true);
-  nodes_[node.RightChild()].SetParent(nid, false);
-  node.SetSplit(split_index, split_value, default_left);
-
-  nodes_[pleft].SetLeaf(left_leaf_weight, leaf_right_child);
-  nodes_[pright].SetLeaf(right_leaf_weight, leaf_right_child);
-
-  this->Stat(nid) = {loss_change, sum_hess, base_weight};
-  this->Stat(pleft) = {0.0f, left_sum, left_leaf_weight};
-  this->Stat(pright) = {0.0f, right_sum, right_leaf_weight};
-
-  this->split_types_.at(nid) = FeatureType::kNumerical;
+[[nodiscard]] bst_node_t RegTree::GetDepth(bst_node_t nidx) const {
+  if (nidx == 0) {
+    return 0;
+  }
+  if (this->IsMultiTarget()) {
+    return this->HostMtView().GetDepth(nidx);
+  }
+  return this->HostScView().GetDepth(nidx);
 }
 
-void RegTree::ExpandCategorical(bst_node_t nid, unsigned split_index,
-                                common::Span<uint32_t> split_cat, bool default_left,
-                                bst_float base_weight,
-                                bst_float left_leaf_weight,
-                                bst_float right_leaf_weight,
-                                bst_float loss_change, float sum_hess,
-                                float left_sum, float right_sum) {
-  this->ExpandNode(nid, split_index, std::numeric_limits<float>::quiet_NaN(),
-                   default_left, base_weight,
-                   left_leaf_weight, right_leaf_weight, loss_change, sum_hess,
-                   left_sum, right_sum);
-
-  size_t orig_size = split_categories_.size();
-  this->split_categories_.resize(orig_size + split_cat.size());
-  std::copy(split_cat.data(), split_cat.data() + split_cat.size(),
-            split_categories_.begin() + orig_size);
-  this->split_types_.at(nid) = FeatureType::kCategorical;
-  this->split_categories_segments_.at(nid).beg = orig_size;
-  this->split_categories_segments_.at(nid).size = split_cat.size();
+[[nodiscard]] bst_node_t RegTree::MaxDepth() const {
+  if (this->IsMultiTarget()) {
+    return this->HostMtView().MaxDepth(RegTree::kRoot);
+  }
+  return this->HostScView().MaxDepth(RegTree::kRoot);
 }
 
-void RegTree::Load(dmlc::Stream* fi) {
-  CHECK_EQ(fi->Read(&param, sizeof(TreeParam)), sizeof(TreeParam));
-  if (!DMLC_IO_NO_ENDIAN_SWAP) {
-    param = param.ByteSwap();
-  }
-  nodes_.resize(param.num_nodes);
-  stats_.resize(param.num_nodes);
-  CHECK_NE(param.num_nodes, 0);
-  CHECK_EQ(fi->Read(dmlc::BeginPtr(nodes_), sizeof(Node) * nodes_.size()),
-           sizeof(Node) * nodes_.size());
-  if (!DMLC_IO_NO_ENDIAN_SWAP) {
-    for (Node& node : nodes_) {
-      node = node.ByteSwap();
-    }
-  }
-  CHECK_EQ(fi->Read(dmlc::BeginPtr(stats_), sizeof(RTreeNodeStat) * stats_.size()),
-           sizeof(RTreeNodeStat) * stats_.size());
-  if (!DMLC_IO_NO_ENDIAN_SWAP) {
-    for (RTreeNodeStat& stat : stats_) {
-      stat = stat.ByteSwap();
-    }
-  }
-  // chg deleted nodes
-  deleted_nodes_.resize(0);
-  for (int i = 1; i < param.num_nodes; ++i) {
-    if (nodes_[i].IsDeleted()) {
-      deleted_nodes_.push_back(i);
-    }
-  }
-  CHECK_EQ(static_cast<int>(deleted_nodes_.size()), param.num_deleted);
-
-  split_types_.resize(param.num_nodes, FeatureType::kNumerical);
-  split_categories_segments_.resize(param.num_nodes);
+void RegTree::SetRoot(float weight, float sum_hess) {
+  CHECK(!IsMultiTarget());
+  CHECK_EQ(this->NumNodes(), 1);
+  this->Stat(kRoot) = {0.0f, sum_hess, weight};
 }
 
-void RegTree::Save(dmlc::Stream* fo) const {
-  CHECK_EQ(param.num_nodes, static_cast<int>(nodes_.size()));
-  CHECK_EQ(param.num_nodes, static_cast<int>(stats_.size()));
-  CHECK_EQ(param.deprecated_num_roots, 1);
-  CHECK_NE(param.num_nodes, 0);
+void RegTree::Expand(tree::ExpandData<float> const& entry, bst_node_t leaf_right_child) {
+  CHECK(!IsMultiTarget());
+  auto const& split = entry.split;
+  auto is_cat = !split.categories.empty();
+  CHECK((*this)[split.nidx].IsLeaf());
+  auto left = this->AllocNode();
+  auto right = this->AllocNode();
+  auto& nodes = nodes_.HostVector();
+  auto& node = nodes[split.nidx];
+  node.SetLeftChild(left);
+  node.SetRightChild(right);
+  nodes[left].SetParent(split.nidx, true);
+  nodes[right].SetParent(split.nidx, false);
+  node.SetSplit(split.fidx, is_cat ? DftBadValue() : split.cond, split.default_left);
+  nodes[left].SetLeaf(0.0f, leaf_right_child);
+  nodes[right].SetLeaf(0.0f, leaf_right_child);
 
-  if (DMLC_IO_NO_ENDIAN_SWAP) {
-    fo->Write(&param, sizeof(TreeParam));
-  } else {
-    TreeParam x = param.ByteSwap();
-    fo->Write(&x, sizeof(x));
+  this->Stat(split.nidx) = {entry.loss_chg, static_cast<float>(entry.parent.sum_hess),
+                            entry.parent.weight};
+  this->Stat(left) = {0.0f, static_cast<float>(entry.left.sum_hess), entry.left.weight};
+  this->Stat(right) = {0.0f, static_cast<float>(entry.right.sum_hess), entry.right.weight};
+
+  split_types_.HostVector().at(split.nidx) =
+      is_cat ? FeatureType::kCategorical : FeatureType::kNumerical;
+  auto& segment = split_categories_segments_.HostVector().at(split.nidx);
+  segment = {};
+  if (is_cat) {
+    auto& categories = split_categories_.HostVector();
+    segment = {categories.size(), split.categories.size()};
+    categories.insert(categories.end(), split.categories.begin(), split.categories.end());
   }
+}
 
-  if (DMLC_IO_NO_ENDIAN_SWAP) {
-    fo->Write(dmlc::BeginPtr(nodes_), sizeof(Node) * nodes_.size());
-  } else {
-    for (const Node& node : nodes_) {
-      Node x = node.ByteSwap();
-      fo->Write(&x, sizeof(x));
+void RegTree::Expand(Context const* ctx, tree::ExpandBatch const& batch) {
+  CHECK(IsMultiTarget());
+
+  xgboost_NVTX_FN_RANGE();
+
+  auto const categories_begin = split_categories_.Size();
+  this->p_mt_tree_->Expand(ctx, batch);
+
+  auto const n_nodes = this->p_mt_tree_->Size();
+  auto& h_split_types = split_types_.HostVector();
+  h_split_types.resize(n_nodes, FeatureType::kNumerical);
+  auto& h_segments = split_categories_segments_.HostVector();
+  h_segments.resize(n_nodes);
+
+  tree::CopyCategoryStorage(ctx, categories_begin, batch, &split_categories_);
+
+  std::size_t category_offset = categories_begin;
+  for (auto const& node : batch) {
+    auto const& split = node.split;
+    auto nidx = split.nidx;
+    auto cats = split.categories;
+    if (cats.empty()) {
+      h_split_types[nidx] = FeatureType::kNumerical;
+      h_segments[nidx] = {};
+    } else {
+      h_split_types[nidx] = FeatureType::kCategorical;
+      h_segments[nidx] = CategoricalSplitMatrix::Segment{category_offset, cats.size()};
+      category_offset += cats.size();
     }
   }
-  if (DMLC_IO_NO_ENDIAN_SWAP) {
-    fo->Write(dmlc::BeginPtr(stats_), sizeof(RTreeNodeStat) * nodes_.size());
-  } else {
-    for (const RTreeNodeStat& stat : stats_) {
-      RTreeNodeStat x = stat.ByteSwap();
-      fo->Write(&x, sizeof(x));
+
+  this->param_.num_nodes = n_nodes;
+}
+
+void RegTree::FinalizeLeaves(float learning_rate) {
+  if (this->IsMultiTarget()) {
+    this->p_mt_tree_->FinalizeLeaves(learning_rate);
+    return;
+  }
+  auto nodes = nodes_.HostSpan();
+  auto stats = stats_.ConstHostSpan();
+  for (bst_node_t nidx = 0; nidx < this->NumNodes(); ++nidx) {
+    if (!nodes[nidx].IsDeleted() && nodes[nidx].IsLeaf()) {
+      nodes[nidx].SetLeaf(stats[nidx].base_weight * learning_rate);
     }
   }
 }
 
+void RegTree::FinalizeLeaves(common::Span<bst_node_t const> leaves,
+                             common::Span<float const> weights, float learning_rate) {
+  CHECK(this->IsMultiTarget());
+  CHECK_EQ(leaves.size(), this->GetNumLeaves());
+  CHECK_EQ(weights.size(), leaves.size() * this->NumTargets());
+  this->p_mt_tree_->FinalizeLeaves(leaves, weights, learning_rate);
+}
+
+RegTree* RegTree::Copy() const {
+  auto ptr = new RegTree{};
+  ptr->param_ = this->param_;
+
+  auto copy = [](auto* lhs, auto const& rhs) {
+    lhs->SetDevice(rhs.Device());
+    lhs->Resize(rhs.Size());
+    lhs->Copy(rhs);
+  };
+
+  copy(&ptr->nodes_, this->nodes_);
+  ptr->deleted_nodes_ = this->deleted_nodes_;
+  copy(&ptr->stats_, this->stats_);
+  copy(&ptr->split_types_, this->split_types_);
+  copy(&ptr->split_categories_, this->split_categories_);
+  copy(&ptr->split_categories_segments_, this->split_categories_segments_);
+
+  if (this->p_mt_tree_) {
+    ptr->p_mt_tree_.reset(this->p_mt_tree_->Copy(&ptr->param_));
+  }
+  return ptr;
+}
+
+tree::ScalarTreeView RegTree::HostScView() const { return tree::ScalarTreeView{this}; }
+
+tree::MultiTargetTreeView RegTree::HostMtView() const { return tree::MultiTargetTreeView{this}; }
+
+template <bool typed>
 void RegTree::LoadCategoricalSplit(Json const& in) {
-  auto const& categories_segments = get<Array const>(in["categories_segments"]);
-  auto const& categories_sizes = get<Array const>(in["categories_sizes"]);
-  auto const& categories_nodes = get<Array const>(in["categories_nodes"]);
-  auto const& categories = get<Array const>(in["categories"]);
+  auto const& categories_segments = get<I64ArrayT<typed>>(in["categories_segments"]);
+  auto const& categories_sizes = get<I64ArrayT<typed>>(in["categories_sizes"]);
+  auto const& categories_nodes = get<I32ArrayT<typed>>(in["categories_nodes"]);
+  auto const& categories = get<I32ArrayT<typed>>(in["categories"]);
 
-  size_t cnt = 0;
+  auto split_type = get<U8ArrayT<typed>>(in["split_type"]);
+  bst_node_t n_nodes = split_type.size();
+  std::size_t cnt = 0;
   bst_node_t last_cat_node = -1;
   if (!categories_nodes.empty()) {
-    last_cat_node = get<Integer const>(categories_nodes[cnt]);
+    last_cat_node = GetElem<Integer>(categories_nodes, cnt);
   }
-  for (bst_node_t nidx = 0; nidx < param.num_nodes; ++nidx) {
+  // `categories_segments' is only available for categorical nodes to prevent overhead for
+  // numerical node. As a result, we need to track the categorical nodes we have processed
+  // so far.
+  auto& h_split_types = split_types_.HostVector();
+  h_split_types.resize(n_nodes, FeatureType::kNumerical);
+  auto& h_split_categories_segments = split_categories_segments_.HostVector();
+  h_split_categories_segments.resize(n_nodes);
+  auto& h_split_categories = this->split_categories_.HostVector();
+
+  for (bst_node_t nidx = 0; nidx < n_nodes; ++nidx) {
+    h_split_types[nidx] = static_cast<FeatureType>(GetElem<Integer>(split_type, nidx));
     if (nidx == last_cat_node) {
-      auto j_begin = get<Integer const>(categories_segments[cnt]);
-      auto j_end = get<Integer const>(categories_sizes[cnt]) + j_begin;
+      auto j_begin = GetElem<Integer>(categories_segments, cnt);
+      auto j_end = GetElem<Integer>(categories_sizes, cnt) + j_begin;
       bst_cat_t max_cat{std::numeric_limits<bst_cat_t>::min()};
-      CHECK_NE(j_end - j_begin, 0) << nidx;
+      CHECK_GT(j_end - j_begin, 0) << nidx;
 
       for (auto j = j_begin; j < j_end; ++j) {
-        auto const &category = get<Integer const>(categories[j]);
+        auto const& category = GetElem<Integer>(categories, j);
         auto cat = common::AsCat(category);
         max_cat = std::max(max_cat, cat);
       }
@@ -924,424 +1033,267 @@ void RegTree::LoadCategoricalSplit(Json const& in) {
       std::vector<uint32_t> cat_bits_storage(size, 0);
       common::CatBitField cat_bits{common::Span<uint32_t>(cat_bits_storage)};
       for (auto j = j_begin; j < j_end; ++j) {
-        cat_bits.Set(common::AsCat(get<Integer const>(categories[j])));
+        cat_bits.Set(common::AsCat(GetElem<Integer>(categories, j)));
       }
 
-      auto begin = split_categories_.size();
-      split_categories_.resize(begin + cat_bits_storage.size());
+      auto begin = h_split_categories.size();
+      h_split_categories.resize(begin + cat_bits_storage.size());
       std::copy(cat_bits_storage.begin(), cat_bits_storage.end(),
-                split_categories_.begin() + begin);
-      split_categories_segments_[nidx].beg = begin;
-      split_categories_segments_[nidx].size = cat_bits_storage.size();
+                h_split_categories.begin() + begin);
+      h_split_categories_segments[nidx].beg = begin;
+      h_split_categories_segments[nidx].size = cat_bits_storage.size();
 
       ++cnt;
       if (cnt == categories_nodes.size()) {
-        last_cat_node = -1;
+        last_cat_node = -1;  // Don't break, we still need to initialize the remaining nodes.
       } else {
-        last_cat_node = get<Integer const>(categories_nodes[cnt]);
+        last_cat_node = GetElem<Integer>(categories_nodes, cnt);
       }
     } else {
-      split_categories_segments_[nidx].beg = categories.size();
-      split_categories_segments_[nidx].size = 0;
+      h_split_categories_segments[nidx].beg = categories.size();
+      h_split_categories_segments[nidx].size = 0;
     }
   }
 }
+
+template void RegTree::LoadCategoricalSplit<true>(Json const& in);
+template void RegTree::LoadCategoricalSplit<false>(Json const& in);
 
 void RegTree::SaveCategoricalSplit(Json* p_out) const {
   auto& out = *p_out;
-  CHECK_EQ(this->split_types_.size(), param.num_nodes);
-  CHECK_EQ(this->GetSplitCategoriesPtr().size(), param.num_nodes);
+  CHECK_EQ(this->split_types_.Size(), this->Size());
+  CHECK_EQ(this->GetSplitCategoriesPtr().size(), this->Size());
 
-  std::vector<Json> categories_segments;
-  std::vector<Json> categories_sizes;
-  std::vector<Json> categories;
-  std::vector<Json> categories_nodes;
+  I64Array categories_segments;
+  I64Array categories_sizes;
+  I32Array categories;        // bst_cat_t = int32_t
+  I32Array categories_nodes;  // bst_note_t = int32_t
+  U8Array split_type(split_types_.Size());
 
-  for (size_t i = 0; i < nodes_.size(); ++i) {
-    if (this->split_types_[i] == FeatureType::kCategorical) {
-      categories_nodes.emplace_back(i);
-      auto begin = categories.size();
-      categories_segments.emplace_back(static_cast<Integer::Int>(begin));
-      auto segment = split_categories_segments_[i];
-      auto node_categories =
-          this->GetSplitCategories().subspan(segment.beg, segment.size);
-      common::KCatBitField const cat_bits(node_categories);
-      for (size_t i = 0; i < cat_bits.Size(); ++i) {
+  auto const& h_split_types = this->split_types_.ConstHostVector();
+  auto const& h_split_categories_segments = this->split_categories_segments_.ConstHostVector();
+
+  for (bst_node_t i = 0, n_nodes = this->Size(); i < n_nodes; ++i) {
+    split_type.Set(i, static_cast<std::underlying_type_t<FeatureType>>(h_split_types[i]));
+    if (h_split_types[i] == FeatureType::kCategorical) {
+      categories_nodes.GetArray().emplace_back(static_cast<std::int32_t>(i));
+      auto begin = categories.Size();
+      categories_segments.GetArray().emplace_back(begin);
+      auto segment = h_split_categories_segments[i];
+      auto cat_bits = common::GetNodeCats(this->GetSplitCategories(DeviceOrd::CPU()), segment);
+      for (size_t i = 0; i < cat_bits.Capacity(); ++i) {
         if (cat_bits.Check(i)) {
-          categories.emplace_back(static_cast<Integer::Int>(i));
+          categories.GetArray().emplace_back(static_cast<std::int32_t>(i));
         }
       }
-      size_t size = categories.size() - begin;
-      categories_sizes.emplace_back(static_cast<Integer::Int>(size));
+      size_t size = categories.Size() - begin;
+      categories_sizes.GetArray().emplace_back(size);
+      CHECK_NE(size, 0);
     }
   }
 
-  out["categories_segments"] = categories_segments;
-  out["categories_sizes"] = categories_sizes;
-  out["categories_nodes"] = categories_nodes;
-  out["categories"] = categories;
+  out["split_type"] = std::move(split_type);
+  out["categories_segments"] = std::move(categories_segments);
+  out["categories_sizes"] = std::move(categories_sizes);
+  out["categories_nodes"] = std::move(categories_nodes);
+  out["categories"] = std::move(categories);
 }
 
-void RegTree::LoadModel(Json const& in) {
-  FromJson(in["tree_param"], &param);
+template <bool typed, bool feature_is_64>
+void LoadModelImpl(Json const& in, TreeParam const& param, std::vector<RTreeNodeStat>* p_stats,
+                   std::vector<RegTree::Node>* p_nodes) {
+  namespace tf = tree_field;
+  auto& stats = *p_stats;
+  auto& nodes = *p_nodes;
+
   auto n_nodes = param.num_nodes;
   CHECK_NE(n_nodes, 0);
   // stats
-  auto const& loss_changes = get<Array const>(in["loss_changes"]);
+  auto const& loss_changes = get<FloatArrayT<typed>>(in[tf::kLossChg]);
   CHECK_EQ(loss_changes.size(), n_nodes);
-  auto const& sum_hessian = get<Array const>(in["sum_hessian"]);
+  auto const& sum_hessian = get<FloatArrayT<typed>>(in[tf::kSumHess]);
   CHECK_EQ(sum_hessian.size(), n_nodes);
-  auto const& base_weights = get<Array const>(in["base_weights"]);
+  auto const& base_weights = get<FloatArrayT<typed>>(in[tf::kBaseWeight]);
   CHECK_EQ(base_weights.size(), n_nodes);
   // nodes
-  auto const& lefts = get<Array const>(in["left_children"]);
+  auto const& lefts = get<I32ArrayT<typed>>(in[tf::kLeft]);
   CHECK_EQ(lefts.size(), n_nodes);
-  auto const& rights = get<Array const>(in["right_children"]);
+  auto const& rights = get<I32ArrayT<typed>>(in[tf::kRight]);
   CHECK_EQ(rights.size(), n_nodes);
-  auto const& parents = get<Array const>(in["parents"]);
+  auto const& parents = get<I32ArrayT<typed>>(in[tf::kParent]);
   CHECK_EQ(parents.size(), n_nodes);
-  auto const& indices = get<Array const>(in["split_indices"]);
+  auto const& indices = get<IndexArrayT<typed, feature_is_64>>(in[tf::kSplitIdx]);
   CHECK_EQ(indices.size(), n_nodes);
-  auto const& conds = get<Array const>(in["split_conditions"]);
+  auto const& conds = get<FloatArrayT<typed>>(in[tf::kSplitCond]);
   CHECK_EQ(conds.size(), n_nodes);
-  auto const& default_left = get<Array const>(in["default_left"]);
+  auto const& default_left = get<U8ArrayT<typed>>(in[tf::kDftLeft]);
   CHECK_EQ(default_left.size(), n_nodes);
 
-  bool has_cat = get<Object const>(in).find("split_type") != get<Object const>(in).cend();
-  std::vector<Json> split_type;
-  if (has_cat) {
-    split_type = get<Array const>(in["split_type"]);
-  }
-  stats_.clear();
-  nodes_.clear();
+  // Initialization
+  stats = std::remove_reference_t<decltype(stats)>(n_nodes);
+  nodes = std::remove_reference_t<decltype(nodes)>(n_nodes);
 
-  stats_.resize(n_nodes);
-  nodes_.resize(n_nodes);
-  split_types_.resize(n_nodes);
-  split_categories_segments_.resize(n_nodes);
+  static_assert(std::is_integral_v<decltype(GetElem<Integer>(lefts, 0))>);
+  static_assert(std::is_floating_point_v<decltype(GetElem<Number>(loss_changes, 0))>);
 
-  CHECK_EQ(n_nodes, split_categories_segments_.size());
+  // Set node
   for (int32_t i = 0; i < n_nodes; ++i) {
-    auto& s = stats_[i];
-    s.loss_chg = get<Number const>(loss_changes[i]);
-    s.sum_hess = get<Number const>(sum_hessian[i]);
-    s.base_weight = get<Number const>(base_weights[i]);
+    auto& s = stats[i];
+    s.loss_chg = GetElem<Number>(loss_changes, i);
+    s.sum_hess = GetElem<Number>(sum_hessian, i);
+    s.base_weight = GetElem<Number>(base_weights, i);
 
-    auto& n = nodes_[i];
-    bst_node_t left = get<Integer const>(lefts[i]);
-    bst_node_t right = get<Integer const>(rights[i]);
-    bst_node_t parent = get<Integer const>(parents[i]);
-    bst_feature_t ind = get<Integer const>(indices[i]);
-    float cond { get<Number const>(conds[i]) };
-    bool dft_left { get<Boolean const>(default_left[i]) };
-    n = Node{left, right, parent, ind, cond, dft_left};
+    auto& n = nodes[i];
+    bst_node_t left = GetElem<Integer>(lefts, i);
+    bst_node_t right = GetElem<Integer>(rights, i);
+    bst_node_t parent = GetElem<Integer>(parents, i);
+    bst_feature_t ind = GetElem<Integer>(indices, i);
+    float cond{GetElem<Number>(conds, i)};
+    bool dft_left{GetElem<Boolean>(default_left, i)};
+    n = RegTree::Node{left, right, parent, ind, cond, dft_left};
+  }
+}
 
-    if (has_cat) {
-      split_types_[i] =
-          static_cast<FeatureType>(get<Integer const>(split_type[i]));
+void RegTree::LoadModel(Json const& in) {
+  namespace tf = tree_field;
+
+  bool typed = IsA<I32Array>(in[tf::kParent]);
+  auto const& in_obj = get<Object const>(in);
+  // basic properties
+  param_.FromJson(in["tree_param"]);
+  // categorical splits
+  bool has_cat = in_obj.find("split_type") != in_obj.cend();
+  if (has_cat) {
+    if (typed) {
+      this->LoadCategoricalSplit<true>(in);
+    } else {
+      this->LoadCategoricalSplit<false>(in);
     }
   }
+  // multi-target
+  if (param_.size_leaf_vector > 1) {
+    this->p_mt_tree_.reset(new MultiTargetTree{&param_});
+    this->GetMultiTargetTree()->LoadModel(in);
+    return;
+  }
 
-  if (has_cat) {
-    this->LoadCategoricalSplit(in);
+  bool feature_is_64 = IsA<I64Array>(in["split_indices"]);
+  auto& h_stats = this->stats_.HostVector();
+  auto& h_nodes = this->nodes_.HostVector();
+  if (typed && feature_is_64) {
+    LoadModelImpl<true, true>(in, param_, &h_stats, &h_nodes);
+  } else if (typed && !feature_is_64) {
+    LoadModelImpl<true, false>(in, param_, &h_stats, &h_nodes);
+  } else if (!typed && feature_is_64) {
+    LoadModelImpl<false, true>(in, param_, &h_stats, &h_nodes);
   } else {
-    this->split_categories_segments_.resize(this->param.num_nodes);
-    std::fill(split_types_.begin(), split_types_.end(), FeatureType::kNumerical);
+    LoadModelImpl<false, false>(in, param_, &h_stats, &h_nodes);
+  }
+
+  if (!has_cat) {
+    this->split_categories_segments_.HostVector().resize(this->param_.num_nodes);
+    auto& h_split_types = this->split_types_.HostVector();
+    h_split_types.resize(this->param_.num_nodes);
+    std::fill(h_split_types.begin(), h_split_types.end(), FeatureType::kNumerical);
   }
 
   deleted_nodes_.clear();
-  for (bst_node_t i = 1; i < param.num_nodes; ++i) {
-    if (nodes_[i].IsDeleted()) {
+  for (bst_node_t i = 1; i < param_.num_nodes; ++i) {
+    if (h_nodes[i].IsDeleted()) {
       deleted_nodes_.push_back(i);
     }
   }
   // easier access to [] operator
   auto& self = *this;
-  for (auto nid = 1; nid < n_nodes; ++nid) {
+  for (auto nid = 1; nid < param_.num_nodes; ++nid) {
     auto parent = self[nid].Parent();
     CHECK_NE(parent, RegTree::kInvalidNodeId);
     self[nid].SetParent(self[nid].Parent(), self[parent].LeftChild() == nid);
   }
-  CHECK_EQ(static_cast<bst_node_t>(deleted_nodes_.size()), param.num_deleted);
-  CHECK_EQ(this->split_categories_segments_.size(), param.num_nodes);
+  CHECK_EQ(static_cast<bst_node_t>(deleted_nodes_.size()), param_.num_deleted);
+  CHECK_EQ(this->split_categories_segments_.Size(), param_.num_nodes);
 }
 
 void RegTree::SaveModel(Json* p_out) const {
+  auto& out = *p_out;
+  // basic properties
+  out["tree_param"] = Object{};
+  param_.ToJson(&out["tree_param"]);
+  // categorical splits
+  this->SaveCategoricalSplit(p_out);
+  // multi-target
+  if (this->IsMultiTarget()) {
+    CHECK_GT(param_.size_leaf_vector, 1);
+    this->GetMultiTargetTree()->SaveModel(p_out);
+    return;
+  }
   /*  Here we are treating leaf node and internal node equally.  Some information like
    *  child node id doesn't make sense for leaf node but we will have to save them to
    *  avoid creating a huge map.  One difficulty is XGBoost has deleted node created by
    *  pruner, and this pruner can be used inside another updater so leaf are not necessary
    *  at the end of node array.
    */
-  auto& out = *p_out;
-  CHECK_EQ(param.num_nodes, static_cast<int>(nodes_.size()));
-  CHECK_EQ(param.num_nodes, static_cast<int>(stats_.size()));
-  out["tree_param"] = ToJson(param);
-  CHECK_EQ(get<String>(out["tree_param"]["num_nodes"]), std::to_string(param.num_nodes));
-  using I = Integer::Int;
-  auto n_nodes = param.num_nodes;
+  CHECK_EQ(param_.num_nodes, static_cast<int>(nodes_.Size()));
+  CHECK_EQ(param_.num_nodes, static_cast<int>(stats_.Size()));
+
+  CHECK_EQ(get<String>(out["tree_param"]["num_nodes"]), std::to_string(param_.num_nodes));
+  auto n_nodes = param_.num_nodes;
 
   // stats
-  std::vector<Json> loss_changes(n_nodes);
-  std::vector<Json> sum_hessian(n_nodes);
-  std::vector<Json> base_weights(n_nodes);
+  F32Array loss_changes(n_nodes);
+  F32Array sum_hessian(n_nodes);
+  F32Array base_weights(n_nodes);
 
   // nodes
-  std::vector<Json> lefts(n_nodes);
-  std::vector<Json> rights(n_nodes);
-  std::vector<Json> parents(n_nodes);
-  std::vector<Json> indices(n_nodes);
-  std::vector<Json> conds(n_nodes);
-  std::vector<Json> default_left(n_nodes);
-  std::vector<Json> split_type(n_nodes);
-  CHECK_EQ(this->split_types_.size(), param.num_nodes);
+  I32Array lefts(n_nodes);
+  I32Array rights(n_nodes);
+  I32Array parents(n_nodes);
 
-  for (bst_node_t i = 0; i < n_nodes; ++i) {
-    auto const& s = stats_[i];
-    loss_changes[i] = s.loss_chg;
-    sum_hessian[i] = s.sum_hess;
-    base_weights[i] = s.base_weight;
+  F32Array conds(n_nodes);
+  U8Array default_left(n_nodes);
+  CHECK_EQ(this->split_types_.Size(), param_.num_nodes);
 
-    auto const& n = nodes_[i];
-    lefts[i] = static_cast<I>(n.LeftChild());
-    rights[i] = static_cast<I>(n.RightChild());
-    parents[i] = static_cast<I>(n.Parent());
-    indices[i] = static_cast<I>(n.SplitIndex());
-    conds[i] = n.SplitCond();
-    default_left[i] = n.DefaultLeft();
+  namespace tf = tree_field;
 
-    split_type[i] = static_cast<I>(this->NodeSplitType(i));
-  }
+  auto const& h_nodes = this->nodes_.ConstHostVector();
+  auto const& h_stats = this->stats_.ConstHostVector();
 
-  this->SaveCategoricalSplit(&out);
+  auto save_tree = [&](auto* p_indices_array) {
+    auto& indices_array = *p_indices_array;
+    for (bst_node_t i = 0; i < n_nodes; ++i) {
+      auto const& s = h_stats[i];
+      loss_changes.Set(i, s.loss_chg);
+      sum_hessian.Set(i, s.sum_hess);
+      base_weights.Set(i, s.base_weight);
 
-  out["split_type"] = std::move(split_type);
-  out["loss_changes"] = std::move(loss_changes);
-  out["sum_hessian"] = std::move(sum_hessian);
-  out["base_weights"] = std::move(base_weights);
-
-  out["left_children"] = std::move(lefts);
-  out["right_children"] = std::move(rights);
-  out["parents"] = std::move(parents);
-  out["split_indices"] = std::move(indices);
-  out["split_conditions"] = std::move(conds);
-  out["default_left"] = std::move(default_left);
-}
-
-void RegTree::CalculateContributionsApprox(const RegTree::FVec &feat,
-                                           std::vector<float>* mean_values,
-                                           bst_float *out_contribs) const {
-  CHECK_GT(mean_values->size(), 0U);
-  // this follows the idea of http://blog.datadive.net/interpreting-random-forests/
-  unsigned split_index = 0;
-  // update bias value
-  bst_float node_value = (*mean_values)[0];
-  out_contribs[feat.Size()] += node_value;
-  if ((*this)[0].IsLeaf()) {
-    // nothing to do anymore
-    return;
-  }
-
-  bst_node_t nid = 0;
-  auto cats = this->GetCategoriesMatrix();
-
-  while (!(*this)[nid].IsLeaf()) {
-    split_index = (*this)[nid].SplitIndex();
-    nid = predictor::GetNextNode<true, true>((*this)[nid], nid,
-                                             feat.GetFvalue(split_index),
-                                             feat.IsMissing(split_index), cats);
-    bst_float new_value = (*mean_values)[nid];
-    // update feature weight
-    out_contribs[split_index] += new_value - node_value;
-    node_value = new_value;
-  }
-  bst_float leaf_value = (*this)[nid].LeafValue();
-  // update leaf feature weight
-  out_contribs[split_index] += leaf_value - node_value;
-}
-
-// Used by TreeShap
-// data we keep about our decision path
-// note that pweight is included for convenience and is not tied with the other attributes
-// the pweight of the i'th path element is the permutation weight of paths with i-1 ones in them
-struct PathElement {
-  int feature_index;
-  bst_float zero_fraction;
-  bst_float one_fraction;
-  bst_float pweight;
-  PathElement() = default;
-  PathElement(int i, bst_float z, bst_float o, bst_float w) :
-    feature_index(i), zero_fraction(z), one_fraction(o), pweight(w) {}
-};
-
-// extend our decision path with a fraction of one and zero extensions
-void ExtendPath(PathElement *unique_path, unsigned unique_depth,
-                bst_float zero_fraction, bst_float one_fraction,
-                int feature_index) {
-  unique_path[unique_depth].feature_index = feature_index;
-  unique_path[unique_depth].zero_fraction = zero_fraction;
-  unique_path[unique_depth].one_fraction = one_fraction;
-  unique_path[unique_depth].pweight = (unique_depth == 0 ? 1.0f : 0.0f);
-  for (int i = unique_depth - 1; i >= 0; i--) {
-    unique_path[i+1].pweight += one_fraction * unique_path[i].pweight * (i + 1)
-                                / static_cast<bst_float>(unique_depth + 1);
-    unique_path[i].pweight = zero_fraction * unique_path[i].pweight * (unique_depth - i)
-                             / static_cast<bst_float>(unique_depth + 1);
-  }
-}
-
-// undo a previous extension of the decision path
-void UnwindPath(PathElement *unique_path, unsigned unique_depth,
-                unsigned path_index) {
-  const bst_float one_fraction = unique_path[path_index].one_fraction;
-  const bst_float zero_fraction = unique_path[path_index].zero_fraction;
-  bst_float next_one_portion = unique_path[unique_depth].pweight;
-
-  for (int i = unique_depth - 1; i >= 0; --i) {
-    if (one_fraction != 0) {
-      const bst_float tmp = unique_path[i].pweight;
-      unique_path[i].pweight = next_one_portion * (unique_depth + 1)
-                               / static_cast<bst_float>((i + 1) * one_fraction);
-      next_one_portion = tmp - unique_path[i].pweight * zero_fraction * (unique_depth - i)
-                               / static_cast<bst_float>(unique_depth + 1);
-    } else {
-      unique_path[i].pweight = (unique_path[i].pweight * (unique_depth + 1))
-                               / static_cast<bst_float>(zero_fraction * (unique_depth - i));
+      auto const& n = h_nodes[i];
+      lefts.Set(i, n.LeftChild());
+      rights.Set(i, n.RightChild());
+      parents.Set(i, n.Parent());
+      indices_array.Set(i, n.SplitIndex());
+      conds.Set(i, n.SplitCond());
+      default_left.Set(i, static_cast<uint8_t>(!!n.DefaultLeft()));
     }
-  }
-
-  for (auto i = path_index; i < unique_depth; ++i) {
-    unique_path[i].feature_index = unique_path[i+1].feature_index;
-    unique_path[i].zero_fraction = unique_path[i+1].zero_fraction;
-    unique_path[i].one_fraction = unique_path[i+1].one_fraction;
-  }
-}
-
-// determine what the total permutation weight would be if
-// we unwound a previous extension in the decision path
-bst_float UnwoundPathSum(const PathElement *unique_path, unsigned unique_depth,
-                         unsigned path_index) {
-  const bst_float one_fraction = unique_path[path_index].one_fraction;
-  const bst_float zero_fraction = unique_path[path_index].zero_fraction;
-  bst_float next_one_portion = unique_path[unique_depth].pweight;
-  bst_float total = 0;
-  for (int i = unique_depth - 1; i >= 0; --i) {
-    if (one_fraction != 0) {
-      const bst_float tmp = next_one_portion * (unique_depth + 1)
-                            / static_cast<bst_float>((i + 1) * one_fraction);
-      total += tmp;
-      next_one_portion = unique_path[i].pweight - tmp * zero_fraction * ((unique_depth - i)
-                         / static_cast<bst_float>(unique_depth + 1));
-    } else if (zero_fraction != 0) {
-      total += (unique_path[i].pweight / zero_fraction) / ((unique_depth - i)
-               / static_cast<bst_float>(unique_depth + 1));
-    } else {
-      CHECK_EQ(unique_path[i].pweight, 0)
-        << "Unique path " << i << " must have zero weight";
-    }
-  }
-  return total;
-}
-
-// recursive computation of SHAP values for a decision tree
-void RegTree::TreeShap(const RegTree::FVec &feat, bst_float *phi,
-                       bst_node_t node_index, unsigned unique_depth,
-                       PathElement *parent_unique_path,
-                       bst_float parent_zero_fraction,
-                       bst_float parent_one_fraction, int parent_feature_index,
-                       int condition, unsigned condition_feature,
-                       bst_float condition_fraction) const {
-  const auto node = (*this)[node_index];
-
-  // stop if we have no weight coming down to us
-  if (condition_fraction == 0) return;
-
-  // extend the unique path
-  PathElement *unique_path = parent_unique_path + unique_depth + 1;
-  std::copy(parent_unique_path, parent_unique_path + unique_depth + 1, unique_path);
-
-  if (condition == 0 || condition_feature != static_cast<unsigned>(parent_feature_index)) {
-    ExtendPath(unique_path, unique_depth, parent_zero_fraction,
-               parent_one_fraction, parent_feature_index);
-  }
-  const unsigned split_index = node.SplitIndex();
-
-  // leaf node
-  if (node.IsLeaf()) {
-    for (unsigned i = 1; i <= unique_depth; ++i) {
-      const bst_float w = UnwoundPathSum(unique_path, unique_depth, i);
-      const PathElement &el = unique_path[i];
-      phi[el.feature_index] += w * (el.one_fraction - el.zero_fraction)
-                                 * node.LeafValue() * condition_fraction;
-    }
-
-  // internal node
+  };
+  if (this->param_.num_feature > static_cast<bst_feature_t>(std::numeric_limits<int32_t>::max())) {
+    I64Array indices_64(n_nodes);
+    save_tree(&indices_64);
+    out[tf::kSplitIdx] = std::move(indices_64);
   } else {
-    // find which branch is "hot" (meaning x would follow it)
-    auto const &cats = this->GetCategoriesMatrix();
-    bst_node_t hot_index = predictor::GetNextNode<true, true>(
-        node, node_index, feat.GetFvalue(split_index),
-        feat.IsMissing(split_index), cats);
-
-    const auto cold_index =
-        (hot_index == node.LeftChild() ? node.RightChild() : node.LeftChild());
-    const bst_float w = this->Stat(node_index).sum_hess;
-    const bst_float hot_zero_fraction = this->Stat(hot_index).sum_hess / w;
-    const bst_float cold_zero_fraction = this->Stat(cold_index).sum_hess / w;
-    bst_float incoming_zero_fraction = 1;
-    bst_float incoming_one_fraction = 1;
-
-    // see if we have already split on this feature,
-    // if so we undo that split so we can redo it for this node
-    unsigned path_index = 0;
-    for (; path_index <= unique_depth; ++path_index) {
-      if (static_cast<unsigned>(unique_path[path_index].feature_index) == split_index) break;
-    }
-    if (path_index != unique_depth + 1) {
-      incoming_zero_fraction = unique_path[path_index].zero_fraction;
-      incoming_one_fraction = unique_path[path_index].one_fraction;
-      UnwindPath(unique_path, unique_depth, path_index);
-      unique_depth -= 1;
-    }
-
-    // divide up the condition_fraction among the recursive calls
-    bst_float hot_condition_fraction = condition_fraction;
-    bst_float cold_condition_fraction = condition_fraction;
-    if (condition > 0 && split_index == condition_feature) {
-      cold_condition_fraction = 0;
-      unique_depth -= 1;
-    } else if (condition < 0 && split_index == condition_feature) {
-      hot_condition_fraction *= hot_zero_fraction;
-      cold_condition_fraction *= cold_zero_fraction;
-      unique_depth -= 1;
-    }
-
-    TreeShap(feat, phi, hot_index, unique_depth + 1, unique_path,
-             hot_zero_fraction * incoming_zero_fraction, incoming_one_fraction,
-             split_index, condition, condition_feature, hot_condition_fraction);
-
-    TreeShap(feat, phi, cold_index, unique_depth + 1, unique_path,
-             cold_zero_fraction * incoming_zero_fraction, 0,
-             split_index, condition, condition_feature, cold_condition_fraction);
-  }
-}
-
-void RegTree::CalculateContributions(const RegTree::FVec &feat,
-                                     std::vector<float>* mean_values,
-                                     bst_float *out_contribs,
-                                     int condition,
-                                     unsigned condition_feature) const {
-  // find the expected value of the tree's predictions
-  if (condition == 0) {
-    bst_float node_value = (*mean_values)[0];
-    out_contribs[feat.Size()] += node_value;
+    I32Array indices_32(n_nodes);
+    save_tree(&indices_32);
+    out[tf::kSplitIdx] = std::move(indices_32);
   }
 
-  // Preallocate space for the unique path data
-  const int maxd = this->MaxDepth(0) + 2;
-  std::vector<PathElement> unique_path_data((maxd * (maxd + 1)) / 2);
+  out[tf::kLossChg] = std::move(loss_changes);
+  out[tf::kSumHess] = std::move(sum_hessian);
+  out[tf::kBaseWeight] = std::move(base_weights);
 
-  TreeShap(feat, out_contribs, 0, 0, unique_path_data.data(),
-           1, 1, -1, condition, condition_feature, 1);
+  out[tf::kLeft] = std::move(lefts);
+  out[tf::kRight] = std::move(rights);
+  out[tf::kParent] = std::move(parents);
+
+  out[tf::kSplitCond] = std::move(conds);
+  out[tf::kDftLeft] = std::move(default_left);
 }
 }  // namespace xgboost

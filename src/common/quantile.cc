@@ -1,123 +1,67 @@
-/*!
- * Copyright 2020-2021 by XGBoost Contributors
+/**
+ * Copyright 2020-2025, XGBoost Contributors
  */
+#include "quantile.h"
+
+#include <cstddef>  // for byte
+#include <cstdint>  // for uint64_t
+#include <iterator>
 #include <limits>
+#include <type_traits>  // for is_trivially_copyable_v
 #include <utility>
 
-#include "rabit/rabit.h"
-#include "quantile.h"
-#include "hist_util.h"
+#include "../collective/aggregator.h"
+#include "../collective/communicator-inl.h"
+#include "../common/error_msg.h"  // for InvalidMaxBin
+#include "../data/adapter.h"
 #include "categorical.h"
+#include "hist_util.h"
 
-namespace xgboost {
-namespace common {
-
-HostSketchContainer::HostSketchContainer(
-    std::vector<bst_row_t> columns_size, int32_t max_bins,
-    common::Span<FeatureType const> feature_types, bool use_group,
-    int32_t n_threads)
+namespace xgboost::common {
+HostSketchContainer::HostSketchContainer(Context const *ctx, bst_bin_t max_bin,
+                                         Span<FeatureType const> feature_types,
+                                         std::vector<bst_idx_t> columns_size, bool use_group)
     : feature_types_(feature_types.cbegin(), feature_types.cend()),
-      columns_size_{std::move(columns_size)}, max_bins_{max_bins},
-      use_group_ind_{use_group}, n_threads_{n_threads} {
+      columns_size_{std::move(columns_size)},
+      max_bins_{max_bin},
+      use_group_ind_{use_group},
+      n_threads_{ctx->Threads()} {
   monitor_.Init(__func__);
+  CHECK_GE(max_bin, 2) << error::InvalidMaxBin();
   CHECK_NE(columns_size_.size(), 0);
   sketches_.resize(columns_size_.size());
   CHECK_GE(n_threads_, 1);
   categories_.resize(columns_size_.size());
+  has_categorical_ = std::any_of(feature_types_.cbegin(), feature_types_.cend(), IsCatOp{});
   ParallelFor(sketches_.size(), n_threads_, Sched::Auto(), [&](auto i) {
-    auto n_bins = std::min(static_cast<size_t>(max_bins_), columns_size_[i]);
-    n_bins = std::max(n_bins, static_cast<decltype(n_bins)>(1));
-    auto eps = 1.0 / (static_cast<float>(n_bins) * WQSketch::kFactor);
+    auto const column_size = static_cast<std::size_t>(columns_size_[i]);
+    auto eps = SketchEpsilon(max_bins_, column_size);
     if (!IsCat(this->feature_types_, i)) {
-      sketches_[i].Init(columns_size_[i], eps);
-      sketches_[i].inqueue.queue.resize(sketches_[i].limit_size * 2);
+      sketches_[i] = WQSketch{column_size, eps};
     }
   });
-}
-
-std::vector<bst_row_t>
-HostSketchContainer::CalcColumnSize(SparsePage const &batch,
-                                    bst_feature_t const n_columns,
-                                    size_t const nthreads) {
-  auto page = batch.GetView();
-  std::vector<std::vector<bst_row_t>> column_sizes(nthreads);
-  for (auto &column : column_sizes) {
-    column.resize(n_columns, 0);
-  }
-
-  ParallelFor(omp_ulong(page.Size()), nthreads, [&](omp_ulong i) {
-    auto &local_column_sizes = column_sizes.at(omp_get_thread_num());
-    auto row = page[i];
-    auto const *p_row = row.data();
-    for (size_t j = 0; j < row.size(); ++j) {
-      local_column_sizes.at(p_row[j].index)++;
-    }
-  });
-  std::vector<bst_row_t> entries_per_columns(n_columns, 0);
-  ParallelFor(bst_omp_uint(n_columns), nthreads, [&](bst_omp_uint i) {
-    for (auto const &thread : column_sizes) {
-      entries_per_columns[i] += thread[i];
-    }
-  });
-  return entries_per_columns;
-}
-
-std::vector<bst_feature_t> HostSketchContainer::LoadBalance(
-    SparsePage const &batch, bst_feature_t n_columns, size_t const nthreads) {
-  /* Some sparse datasets have their mass concentrating on small number of features.  To
-   * avoid waiting for a few threads running forever, we here distribute different number
-   * of columns to different threads according to number of entries.
-   */
-  auto page = batch.GetView();
-  size_t const total_entries = page.data.size();
-  size_t const entries_per_thread = common::DivRoundUp(total_entries, nthreads);
-
-  std::vector<std::vector<bst_row_t>> column_sizes(nthreads);
-  for (auto& column : column_sizes) {
-    column.resize(n_columns, 0);
-  }
-  std::vector<bst_row_t> entries_per_columns =
-      CalcColumnSize(batch, n_columns, nthreads);
-  std::vector<bst_feature_t> cols_ptr(nthreads + 1, 0);
-  size_t count {0};
-  size_t current_thread {1};
-
-  for (auto col : entries_per_columns) {
-    cols_ptr.at(current_thread)++;  // add one column to thread
-    count += col;
-    CHECK_LE(count, total_entries);
-    if (count > entries_per_thread) {
-      current_thread++;
-      count = 0;
-      cols_ptr.at(current_thread) = cols_ptr[current_thread-1];
-    }
-  }
-  // Idle threads.
-  for (; current_thread < cols_ptr.size() - 1; ++current_thread) {
-    cols_ptr[current_thread+1] = cols_ptr[current_thread];
-  }
-  return cols_ptr;
 }
 
 namespace {
 // Function to merge hessian and sample weights
-std::vector<float> MergeWeights(MetaInfo const &info,
-                                Span<float> const hessian,
-                                bool use_group, int32_t n_threads) {
+std::vector<float> MergeWeights(MetaInfo const &info, Span<float const> hessian, bool use_group,
+                                int32_t n_threads) {
   CHECK_EQ(hessian.size(), info.num_row_);
   std::vector<float> results(hessian.size());
   auto const &group_ptr = info.group_ptr_;
-  auto const& weights = info.weights_.HostVector();
-  auto get_weight = [&](size_t i) { return weights.empty() ? 1.0f : weights[i]; };
+  auto const &weights = info.weights_.HostVector();
+  auto get_weight = [&](size_t i) {
+    return weights.empty() ? 1.0f : weights[i];
+  };
   if (use_group) {
     CHECK_GE(group_ptr.size(), 2);
     CHECK_EQ(group_ptr.back(), hessian.size());
     size_t cur_group = 0;
     for (size_t i = 0; i < hessian.size(); ++i) {
-      results[i] = hessian[i] * get_weight(cur_group);
-      if (i == group_ptr[cur_group + 1]) {
-        cur_group++;
+      while (cur_group + 1 < group_ptr.size() && i >= group_ptr[cur_group + 1]) {
+        ++cur_group;
       }
+      results[i] = hessian[i] * get_weight(cur_group);
     }
   } else {
     ParallelFor(hessian.size(), n_threads, Sched::Auto(),
@@ -126,30 +70,268 @@ std::vector<float> MergeWeights(MetaInfo const &info,
   return results;
 }
 
-std::vector<float> UnrollGroupWeights(MetaInfo const &info) {
-  std::vector<float> const &group_weights = info.weights_.HostVector();
-  if (group_weights.empty()) {
-    return group_weights;
+template <typename T>
+void WritePODAt(std::vector<std::byte> *out, std::size_t offset, T value) {
+  static_assert(std::is_trivially_copyable_v<T>);
+  auto const *src = reinterpret_cast<std::byte const *>(&value);
+  std::copy_n(src, sizeof(T), out->begin() + static_cast<std::ptrdiff_t>(offset));
+}
+
+template <typename T>
+[[nodiscard]] T ReadPOD(Span<std::byte const> bytes, std::size_t *cursor) {
+  static_assert(std::is_trivially_copyable_v<T>);
+  T value{};
+  CHECK_LE(*cursor, bytes.size());
+  CHECK_LE(sizeof(T), bytes.size() - *cursor);
+  auto *dst = reinterpret_cast<std::byte *>(&value);
+  std::copy_n(bytes.data() + *cursor, sizeof(T), dst);
+  *cursor += sizeof(T);
+  return value;
+}
+
+// Serialization payload for distributed numerical sketch merging over AllreduceV.
+// Encodes per-feature represented element counts, per-feature entry counts, and contiguous
+// sketch entries.
+struct SketchReducePayload {
+  [[nodiscard]] static std::vector<std::byte> SerializeFromSummaries(
+      Span<bst_feature_t const> numeric_features,
+      std::vector<WQuantileSketch::SummaryContainer> const &reduced,
+      std::vector<std::size_t> const &num_elements) {
+    CHECK_EQ(reduced.size(), num_elements.size());
+    std::size_t total_entries = 0;
+    for (auto fidx : numeric_features) {
+      total_entries += reduced.at(fidx).Size();
+    }
+
+    std::vector<std::byte> bytes;
+    InitHeader(&bytes, numeric_features.size(), total_entries);
+
+    for (std::size_t i = 0; i < numeric_features.size(); ++i) {
+      auto fidx = numeric_features[i];
+      SetNumElements(&bytes, numeric_features.size(), i, num_elements.at(fidx));
+      auto out_entries = reduced.at(fidx).Entries();
+      AppendEntries(&bytes, numeric_features.size(), i, out_entries);
+    }
+    auto header_bytes = HeaderBytes(numeric_features.size());
+    CHECK_EQ((bytes.size() - header_bytes) / sizeof(WQuantileSketch::Entry), total_entries);
+    return bytes;
   }
 
-  size_t n_samples = info.num_row_;
-  auto const &group_ptr = info.group_ptr_;
-  std::vector<float> results(n_samples);
-  CHECK_GE(group_ptr.size(), 2);
-  CHECK_EQ(group_ptr.back(), n_samples);
-  size_t cur_group = 0;
-  for (size_t i = 0; i < n_samples; ++i) {
-    results[i] = group_weights[cur_group];
-    if (i == group_ptr[cur_group + 1]) {
-      cur_group++;
+  [[nodiscard]] static std::size_t HeaderBytes(std::size_t n_features) {
+    return sizeof(std::uint64_t) + 2 * n_features * sizeof(std::uint64_t);
+  }
+
+  static void SetNumElements(std::vector<std::byte> *bytes, std::size_t n_features, std::size_t i,
+                             std::size_t num_elements) {
+    CHECK(bytes);
+    auto count_offset = sizeof(std::uint64_t) + i * sizeof(std::uint64_t);
+    CHECK_LE(count_offset + sizeof(std::uint64_t), HeaderBytes(n_features));
+    WritePODAt<std::uint64_t>(bytes, count_offset, static_cast<std::uint64_t>(num_elements));
+  }
+
+  static void AppendEntries(std::vector<std::byte> *bytes, std::size_t n_features, std::size_t i,
+                            Span<WQuantileSketch::Entry const> entries) {
+    CHECK(bytes);
+    auto count_offset =
+        sizeof(std::uint64_t) + n_features * sizeof(std::uint64_t) + i * sizeof(std::uint64_t);
+    CHECK_LE(count_offset + sizeof(std::uint64_t), HeaderBytes(n_features));
+    WritePODAt<std::uint64_t>(bytes, count_offset, static_cast<std::uint64_t>(entries.size()));
+    if (entries.empty()) {
+      return;
+    }
+    auto entries_bytes = entries.size() * sizeof(WQuantileSketch::Entry);
+    auto const *src = reinterpret_cast<std::byte const *>(entries.data());
+    bytes->insert(bytes->end(), src, src + entries_bytes);
+  }
+
+  static void InitHeader(std::vector<std::byte> *bytes, std::size_t n_features,
+                         std::size_t max_entries) {
+    CHECK(bytes);
+    auto const header_bytes = HeaderBytes(n_features);
+    bytes->clear();
+    bytes->reserve(header_bytes + max_entries * sizeof(WQuantileSketch::Entry));
+    bytes->resize(header_bytes);
+    WritePODAt<std::uint64_t>(bytes, 0, static_cast<std::uint64_t>(n_features));
+  }
+
+  [[nodiscard]] static SketchReducePayload Parse(Span<std::byte> bytes) {
+    std::size_t cursor = 0;
+    auto n_features = ReadPOD<std::uint64_t>(bytes, &cursor);
+
+    std::vector<std::size_t> num_elements(n_features, 0);
+    for (std::size_t i = 0; i < n_features; ++i) {
+      num_elements[i] = static_cast<std::size_t>(ReadPOD<std::uint64_t>(bytes, &cursor));
+    }
+
+    std::vector<std::size_t> offsets(n_features + 1, 0);
+    for (std::size_t i = 0; i < n_features; ++i) {
+      auto n_i = static_cast<std::size_t>(ReadPOD<std::uint64_t>(bytes, &cursor));
+      offsets[i + 1] = offsets[i] + n_i;
+    }
+
+    auto n_entries = offsets.back();
+    auto payload_bytes = n_entries * sizeof(WQuantileSketch::Entry);
+    CHECK_EQ(cursor + payload_bytes, bytes.size());
+
+    WQuantileSketch::Entry *entries = nullptr;
+    if (n_entries != 0) {
+      auto ptr = bytes.data() + cursor;
+      auto addr = reinterpret_cast<std::uintptr_t>(ptr);
+      CHECK_EQ(addr % alignof(WQuantileSketch::Entry), 0);
+      entries = reinterpret_cast<WQuantileSketch::Entry *>(ptr);
+    }
+
+    return {std::move(offsets), std::move(num_elements),
+            Span<WQuantileSketch::Entry>{entries, n_entries}};
+  }
+
+  [[nodiscard]] std::size_t NumFeatures() const { return offsets_.size() - 1; }
+  [[nodiscard]] std::size_t TotalEntries() const { return entries_.size(); }
+  [[nodiscard]] std::size_t NumElements(std::size_t idx) const { return num_elements_.at(idx); }
+
+  [[nodiscard]] Span<WQuantileSketch::Entry> Entries(std::size_t idx) const {
+    auto beg = offsets_.at(idx);
+    auto end = offsets_.at(idx + 1);
+    auto n = end - beg;
+    if (n == 0) {
+      return Span<WQuantileSketch::Entry>{};
+    }
+    return {entries_.data() + beg, n};
+  }
+
+  [[nodiscard]] WQuantileSketch::Summary SummaryAt(std::size_t idx) const {
+    auto entries = this->Entries(idx);
+    return {entries, entries.size()};
+  }
+
+ private:
+  SketchReducePayload(std::vector<std::size_t> offsets, std::vector<std::size_t> num_elements,
+                      Span<WQuantileSketch::Entry> entries)
+      : offsets_{std::move(offsets)}, num_elements_{std::move(num_elements)}, entries_{entries} {}
+
+  std::vector<std::size_t> offsets_;
+  std::vector<std::size_t> num_elements_;
+  Span<WQuantileSketch::Entry> entries_;
+};
+
+// Serialization payload for distributed categorical value union over AllreduceV.
+// Encodes per-feature value counts plus contiguous category values.
+struct CategoricalReducePayload {
+  [[nodiscard]] static std::vector<std::byte> SerializeFromCategories(
+      Span<bst_feature_t const> categorical_features,
+      std::vector<std::set<float>> const &categories) {
+    std::size_t total_values = 0;
+    for (auto fidx : categorical_features) {
+      total_values += categories.at(fidx).size();
+    }
+
+    std::vector<std::byte> bytes;
+    InitHeader(&bytes, categorical_features.size(), total_values);
+    for (std::size_t i = 0; i < categorical_features.size(); ++i) {
+      auto fidx = categorical_features[i];
+      AppendValues(&bytes, i, categories.at(fidx));
+    }
+
+    auto header_bytes = HeaderBytes(categorical_features.size());
+    CHECK_EQ((bytes.size() - header_bytes) / sizeof(float), total_values);
+    return bytes;
+  }
+
+  [[nodiscard]] static std::size_t HeaderBytes(std::size_t n_features) {
+    return sizeof(std::uint64_t) + n_features * sizeof(std::uint64_t);
+  }
+
+  static void AppendValues(std::vector<std::byte> *bytes, std::size_t i, Span<float const> values) {
+    CHECK(bytes);
+    auto count_offset = sizeof(std::uint64_t) + i * sizeof(std::uint64_t);
+    CHECK_LE(count_offset + sizeof(std::uint64_t), bytes->size());
+    WritePODAt<std::uint64_t>(bytes, count_offset, static_cast<std::uint64_t>(values.size()));
+    if (values.empty()) {
+      return;
+    }
+    auto values_bytes = values.size() * sizeof(float);
+    auto const *src = reinterpret_cast<std::byte const *>(values.data());
+    bytes->insert(bytes->end(), src, src + values_bytes);
+  }
+
+  static void AppendValues(std::vector<std::byte> *bytes, std::size_t i,
+                           std::set<float> const &values) {
+    CHECK(bytes);
+    auto count_offset = sizeof(std::uint64_t) + i * sizeof(std::uint64_t);
+    CHECK_LE(count_offset + sizeof(std::uint64_t), bytes->size());
+    WritePODAt<std::uint64_t>(bytes, count_offset, static_cast<std::uint64_t>(values.size()));
+    if (values.empty()) {
+      return;
+    }
+
+    auto offset = bytes->size();
+    bytes->resize(offset + values.size() * sizeof(float));
+    auto dst = bytes->begin() + static_cast<std::ptrdiff_t>(offset);
+    for (auto value : values) {
+      auto const *src = reinterpret_cast<std::byte const *>(&value);
+      dst = std::copy_n(src, sizeof(float), dst);
     }
   }
-  return results;
-}
+
+  static void InitHeader(std::vector<std::byte> *bytes, std::size_t n_features,
+                         std::size_t max_values) {
+    CHECK(bytes);
+    auto const header_bytes = HeaderBytes(n_features);
+    bytes->clear();
+    bytes->reserve(header_bytes + max_values * sizeof(float));
+    bytes->resize(header_bytes);
+    WritePODAt<std::uint64_t>(bytes, 0, static_cast<std::uint64_t>(n_features));
+  }
+
+  [[nodiscard]] static CategoricalReducePayload Parse(Span<std::byte> bytes) {
+    std::size_t cursor = 0;
+    auto n_features = ReadPOD<std::uint64_t>(bytes, &cursor);
+
+    std::vector<std::size_t> offsets(n_features + 1, 0);
+    for (std::size_t i = 0; i < n_features; ++i) {
+      auto n_i = static_cast<std::size_t>(ReadPOD<std::uint64_t>(bytes, &cursor));
+      offsets[i + 1] = offsets[i] + n_i;
+    }
+
+    auto n_values = offsets.back();
+    auto payload_bytes = n_values * sizeof(float);
+    CHECK_EQ(cursor + payload_bytes, bytes.size());
+
+    float const *values = nullptr;
+    if (n_values != 0) {
+      auto ptr = bytes.data() + cursor;
+      auto addr = reinterpret_cast<std::uintptr_t>(ptr);
+      CHECK_EQ(addr % alignof(float), 0);
+      values = reinterpret_cast<float const *>(ptr);
+    }
+
+    return {std::move(offsets), Span<float const>{values, n_values}};
+  }
+
+  [[nodiscard]] std::size_t NumFeatures() const { return offsets_.size() - 1; }
+  [[nodiscard]] std::size_t TotalValues() const { return values_.size(); }
+
+  [[nodiscard]] Span<float const> Values(std::size_t idx) const {
+    auto beg = offsets_.at(idx);
+    auto end = offsets_.at(idx + 1);
+    auto n = end - beg;
+    if (n == 0) {
+      return Span<float const>{};
+    }
+    return {values_.data() + beg, n};
+  }
+
+ private:
+  CategoricalReducePayload(std::vector<std::size_t> offsets, Span<float const> values)
+      : offsets_{std::move(offsets)}, values_{values} {}
+
+  std::vector<std::size_t> offsets_;
+  Span<float const> values_;
+};
 }  // anonymous namespace
 
-void HostSketchContainer::PushRowPage(
-    SparsePage const &page, MetaInfo const &info, Span<float> hessian) {
+void HostSketchContainer::PushRowPage(SparsePage const &page, MetaInfo const &info,
+                                      Span<float const> hessian) {
   monitor_.Start(__func__);
   bst_feature_t n_columns = info.num_col_;
   auto is_dense = info.num_nonzero_ == info.num_col_ * info.num_row_;
@@ -158,260 +340,279 @@ void HostSketchContainer::PushRowPage(
 
   // glue these conditions using ternary operator to avoid making data copies.
   auto const &weights =
-      hessian.empty()
-          ? (use_group_ind_ ? UnrollGroupWeights(info)     // use group weight
-                            : info.weights_.HostVector())  // use sample weight
-          : MergeWeights(
-                info, hessian, use_group_ind_,
-                n_threads_);  // use hessian merged with group/sample weights
+      hessian.empty() ? (use_group_ind_ ? detail::UnrollGroupWeights(info)  // use group weight
+                                        : info.weights_.HostVector())       // use sample weight
+                      : MergeWeights(info, hessian, use_group_ind_,
+                                     n_threads_);  // use hessian merged with group/sample weights
   if (!weights.empty()) {
     CHECK_EQ(weights.size(), info.num_row_);
   }
 
-  auto batch = page.GetView();
-  // Parallel over columns.  Each thread owns a set of consecutive columns.
-  auto const ncol = static_cast<bst_feature_t>(info.num_col_);
-  auto thread_columns_ptr = LoadBalance(page, info.num_col_, n_threads_);
-
-  dmlc::OMPException exc;
-#pragma omp parallel num_threads(n_threads_)
-  {
-    exc.Run([&]() {
-      auto tid = static_cast<uint32_t>(omp_get_thread_num());
-      auto const begin = thread_columns_ptr[tid];
-      auto const end = thread_columns_ptr[tid + 1];
-
-      // do not iterate if no columns are assigned to the thread
-      if (begin < end && end <= ncol) {
-        for (size_t i = 0; i < batch.Size(); ++i) {
-          size_t const ridx = page.base_rowid + i;
-          SparsePage::Inst const inst = batch[i];
-          auto w = weights.empty() ? 1.0f : weights[ridx];
-          auto p_inst = inst.data();
-          if (is_dense) {
-            for (size_t ii = begin; ii < end; ii++) {
-              if (IsCat(feature_types_, ii)) {
-                categories_[ii].emplace(AsCat(p_inst[ii].fvalue));
-              } else {
-                sketches_[ii].Push(p_inst[ii].fvalue, w);
-              }
-            }
-          } else {
-            for (size_t i = 0; i < inst.size(); ++i) {
-              auto const& entry = p_inst[i];
-              if (entry.index >= begin && entry.index < end) {
-                if (IsCat(feature_types_, entry.index)) {
-                  categories_[entry.index].emplace(AsCat(entry.fvalue));
-                } else {
-                  sketches_[entry.index].Push(entry.fvalue, w);
-                }
-              }
-            }
-          }
-        }
-      }
-    });
-  }
-  exc.Rethrow();
+  auto batch = data::SparsePageAdapterBatch{page.GetView()};
+  this->PushRowPageImpl(batch, page.base_rowid, OptionalWeights{weights}, page.data.Size(),
+                        info.num_col_, is_dense, [](auto) { return true; });
   monitor_.Stop(__func__);
 }
 
-void HostSketchContainer::GatherSketchInfo(
-    std::vector<WQSketch::SummaryContainer> const &reduced,
-    std::vector<size_t> *p_worker_segments,
-    std::vector<bst_row_t> *p_sketches_scan,
-    std::vector<WQSketch::Entry> *p_global_sketches) {
-  auto& worker_segments = *p_worker_segments;
-  worker_segments.resize(1, 0);
-  auto world = rabit::GetWorldSize();
-  auto rank = rabit::GetRank();
-  auto n_columns = sketches_.size();
-
-  std::vector<bst_row_t> sketch_size;
-  for (auto const& sketch : reduced) {
-    sketch_size.push_back(sketch.size);
-  }
-  std::vector<bst_row_t>& sketches_scan = *p_sketches_scan;
-  sketches_scan.resize((n_columns + 1) * world, 0);
-  size_t beg_scan = rank * (n_columns + 1);
-  std::partial_sum(sketch_size.cbegin(), sketch_size.cend(),
-                   sketches_scan.begin() + beg_scan + 1);
-  // Gather all column pointers
-  rabit::Allreduce<rabit::op::Sum>(sketches_scan.data(), sketches_scan.size());
-
-  for (int32_t i = 0; i < world; ++i) {
-    size_t back = (i + 1) * (n_columns + 1) - 1;
-    auto n_entries = sketches_scan.at(back);
-    worker_segments.push_back(n_entries);
-  }
-  // Offset of sketch from each worker.
-  std::partial_sum(worker_segments.begin(), worker_segments.end(),
-                   worker_segments.begin());
-  CHECK_GE(worker_segments.size(), 1);
-  auto total = worker_segments.back();
-
-  auto& global_sketches = *p_global_sketches;
-  global_sketches.resize(total, WQSketch::Entry{0, 0, 0, 0});
-  auto worker_sketch = Span<WQSketch::Entry>{global_sketches}.subspan(
-      worker_segments[rank], worker_segments[rank + 1] - worker_segments[rank]);
-  size_t cursor = 0;
-  for (auto const &sketch : reduced) {
-    std::copy(sketch.data, sketch.data + sketch.size,
-              worker_sketch.begin() + cursor);
-    cursor += sketch.size;
+template <typename Batch>
+void HostSketchContainer::PushAdapterBatch(Batch const &batch, size_t base_rowid,
+                                           MetaInfo const &info, float missing) {
+  auto const &h_weights =
+      (use_group_ind_ ? detail::UnrollGroupWeights(info) : info.weights_.HostVector());
+  if (!use_group_ind_ && !h_weights.empty()) {
+    CHECK_EQ(h_weights.size(), batch.Size()) << "Invalid size of sample weight.";
   }
 
-  static_assert(sizeof(WQSketch::Entry) / 4 == sizeof(float), "");
-  rabit::Allreduce<rabit::op::Sum>(
-      reinterpret_cast<float *>(global_sketches.data()),
-      global_sketches.size() * sizeof(WQSketch::Entry) / sizeof(float));
+  auto is_valid = data::IsValidFunctor{missing};
+  auto weights = OptionalWeights{Span<float const>{h_weights}};
+  // the nnz from info is not reliable as sketching might be the first place to go through
+  // the data.
+  auto is_dense = info.num_nonzero_ == info.num_col_ * info.num_row_;
+  CHECK(!this->columns_size_.empty());
+  this->PushRowPageImpl(batch, base_rowid, weights, info.num_nonzero_, info.num_col_, is_dense,
+                        is_valid);
 }
 
-void HostSketchContainer::AllReduce(
-    std::vector<WQSketch::SummaryContainer> *p_reduced,
-    std::vector<int32_t>* p_num_cuts) {
+#define INSTANTIATE(_type)                                          \
+  template void HostSketchContainer::PushAdapterBatch<data::_type>( \
+      data::_type const &batch, size_t base_rowid, MetaInfo const &info, float missing);
+
+INSTANTIATE(ArrayAdapterBatch)
+INSTANTIATE(DenseAdapterBatch)
+INSTANTIATE(CSRArrayAdapterBatch)
+INSTANTIATE(CSCArrayAdapterBatch)
+INSTANTIATE(SparsePageAdapterBatch)
+INSTANTIATE(ColumnarAdapterBatch)
+INSTANTIATE(EncColumnarAdapterBatch)
+
+#undef INSTANTIATE
+
+auto HostSketchContainer::AllreduceCategories(Context const *ctx,
+                                              Span<bst_feature_t const> categorical_features)
+    -> std::vector<std::set<float>> {
+  std::vector<std::set<float>> reduced_categories(categorical_features.size());
+  if (categorical_features.empty()) {
+    return reduced_categories;
+  }
+
+  if (collective::GetWorldSize() == 1) {
+    for (std::size_t i = 0; i < categorical_features.size(); ++i) {
+      reduced_categories[i] = categories_[categorical_features[i]];
+    }
+    return reduced_categories;
+  }
+
+  auto merged =
+      CategoricalReducePayload::SerializeFromCategories(categorical_features, categories_);
+  std::vector<float> merge_workspace;
+  auto rc = collective::AllreduceV(
+      ctx, &merged,
+      [&](common::Span<std::byte const> a, common::Span<std::byte const> b,
+          std::vector<std::byte> *out) {
+        auto a_payload = CategoricalReducePayload::Parse(
+            Span<std::byte>{const_cast<std::byte *>(a.data()), a.size()});
+        auto b_payload = CategoricalReducePayload::Parse(
+            Span<std::byte>{const_cast<std::byte *>(b.data()), b.size()});
+        CHECK_EQ(a_payload.NumFeatures(), categorical_features.size());
+        CHECK_EQ(b_payload.NumFeatures(), categorical_features.size());
+
+        auto max_values = a_payload.TotalValues() + b_payload.TotalValues();
+        CategoricalReducePayload::InitHeader(out, categorical_features.size(), max_values);
+
+        for (std::size_t i = 0; i < categorical_features.size(); ++i) {
+          auto a_values = a_payload.Values(i);
+          auto b_values = b_payload.Values(i);
+          merge_workspace.clear();
+          merge_workspace.reserve(a_values.size() + b_values.size());
+          std::set_union(a_values.cbegin(), a_values.cend(), b_values.cbegin(), b_values.cend(),
+                         std::back_inserter(merge_workspace));
+          CategoricalReducePayload::AppendValues(out, i, Span<float const>{merge_workspace});
+        }
+      });
+  collective::SafeColl(rc);
+
+  auto reduced_payload = CategoricalReducePayload::Parse(Span<std::byte>{merged});
+  CHECK_EQ(reduced_payload.NumFeatures(), categorical_features.size());
+  for (std::size_t i = 0; i < categorical_features.size(); ++i) {
+    auto values = reduced_payload.Values(i);
+    reduced_categories[i].insert(values.cbegin(), values.cend());
+  }
+  return reduced_categories;
+}
+
+auto HostSketchContainer::AllReduce(Context const *ctx, Span<bst_feature_t const> numeric_features)
+    -> std::vector<WQSketch::SummaryContainer> {
   monitor_.Start(__func__);
-  auto& num_cuts = *p_num_cuts;
-  CHECK_EQ(num_cuts.size(), 0);
-  num_cuts.resize(sketches_.size());
 
-  auto &reduced = *p_reduced;
-  reduced.resize(sketches_.size());
-
-  size_t n_columns = sketches_.size();
-  rabit::Allreduce<rabit::op::Max>(&n_columns, 1);
+  // Sanity check the number of features across workers before allreduce
+  bst_feature_t n_columns = sketches_.size();
+  auto rc = collective::Allreduce(ctx, &n_columns, collective::Op::kMax);
+  collective::SafeColl(rc);
   CHECK_EQ(n_columns, sketches_.size()) << "Number of columns differs across workers";
 
-  // Prune the intermediate num cuts for synchronization.
-  std::vector<bst_row_t> global_column_size(columns_size_);
-  rabit::Allreduce<rabit::op::Sum>(global_column_size.data(), global_column_size.size());
+  std::vector<WQSketch::SummaryContainer> reduced(sketches_.size());
+  std::vector<std::size_t> num_elements(sketches_.size(), 0);
 
-  ParallelFor(sketches_.size(), n_threads_, [&](size_t i) {
-    int32_t intermediate_num_cuts = static_cast<int32_t>(
-        std::min(global_column_size[i],
-                 static_cast<size_t>(max_bins_ * WQSketch::kFactor)));
-    if (global_column_size[i] != 0) {
-      WQSketch::SummaryContainer out;
-      sketches_[i].GetSummary(&out);
-      reduced[i].Reserve(intermediate_num_cuts);
-      CHECK(reduced[i].data);
-      reduced[i].SetPrune(out, intermediate_num_cuts);
-    }
-    num_cuts[i] = intermediate_num_cuts;
+  // Size local summaries with the same O(log n / eps) budget as the single-machine sketch.
+  ParallelFor(numeric_features.size(), n_threads_, [&](size_t idx) {
+    auto fidx = numeric_features[idx];
+    num_elements[fidx] = sketches_[fidx].NumElements();
+    auto cut_target = SketchSummaryBudget(max_bins_, num_elements[fidx]);
+    reduced[fidx] = sketches_[fidx].GetSummary(cut_target);
   });
 
-  auto world = rabit::GetWorldSize();
-  if (world == 1) {
+  // Early exit: no allreduce needed when there is one worker or no numeric features.
+  if (collective::GetWorldSize() == 1 || numeric_features.empty()) {
     monitor_.Stop(__func__);
-    return;
+    return reduced;
   }
 
-  std::vector<size_t> worker_segments(1, 0);  // CSC pointer to sketches.
-  std::vector<bst_row_t> sketches_scan((n_columns + 1) * world, 0);
+  // Serialize local sketches to a byte array for allreduce
+  auto merged = SketchReducePayload::SerializeFromSummaries(
+      Span<bst_feature_t const>{numeric_features}, reduced, num_elements);
+  WQSketch::SummaryContainer tmp;
+  auto reduce_rc = collective::AllreduceV(
+      ctx, &merged,
+      [&](common::Span<std::byte const> a, common::Span<std::byte const> b,
+          std::vector<std::byte> *out) {
+        auto a_payload = SketchReducePayload::Parse(
+            Span<std::byte>{const_cast<std::byte *>(a.data()), a.size()});
+        auto b_payload = SketchReducePayload::Parse(
+            Span<std::byte>{const_cast<std::byte *>(b.data()), b.size()});
+        CHECK_EQ(a_payload.NumFeatures(), numeric_features.size());
+        CHECK_EQ(b_payload.NumFeatures(), numeric_features.size());
 
-  std::vector<WQSketch::Entry> global_sketches;
-  this->GatherSketchInfo(reduced, &worker_segments, &sketches_scan,
-                         &global_sketches);
+        auto max_entries = a_payload.TotalEntries() + b_payload.TotalEntries();
+        std::size_t max_pruned_entries{0};
+        for (std::size_t i = 0; i < numeric_features.size(); ++i) {
+          auto num_elements = a_payload.NumElements(i) + b_payload.NumElements(i);
+          max_pruned_entries += SketchSummaryBudget(max_bins_, num_elements);
+        }
+        max_entries = std::min(max_entries, max_pruned_entries);
+        SketchReducePayload::InitHeader(out, numeric_features.size(), max_entries);
 
-  std::vector<WQSketch::SummaryContainer> final_sketches(n_columns);
-  ParallelFor(n_columns, n_threads_, [&](auto fidx) {
-    int32_t intermediate_num_cuts = num_cuts[fidx];
-    auto nbytes =
-        WQSketch::SummaryContainer::CalcMemCost(intermediate_num_cuts);
+        for (std::size_t i = 0; i < numeric_features.size(); ++i) {
+          auto a_summary = a_payload.SummaryAt(i);
+          auto b_summary = b_payload.SummaryAt(i);
+          auto num_elements = a_payload.NumElements(i) + b_payload.NumElements(i);
+          auto cut_target = SketchSummaryBudget(max_bins_, num_elements);
+          tmp.Reserve(a_summary.Size() + b_summary.Size());
+          tmp.CopyFrom(a_summary);
+          tmp.SetCombine(b_summary);
+          tmp.SetPrune(cut_target);
 
-    for (int32_t i = 1; i < world + 1; ++i) {
-      auto size = worker_segments.at(i) - worker_segments[i - 1];
-      auto worker_sketches = Span<WQSketch::Entry>{global_sketches}.subspan(
-          worker_segments[i - 1], size);
-      auto worker_scan =
-          Span<bst_row_t>(sketches_scan)
-              .subspan((i - 1) * (n_columns + 1), (n_columns + 1));
+          SketchReducePayload::SetNumElements(out, numeric_features.size(), i, num_elements);
+          auto pruned_entries = tmp.Entries();
+          SketchReducePayload::AppendEntries(out, numeric_features.size(), i, pruned_entries);
+        }
+      });
+  collective::SafeColl(reduce_rc);
 
-      auto worker_feature = worker_sketches.subspan(
-          worker_scan[fidx], worker_scan[fidx + 1] - worker_scan[fidx]);
-      CHECK(worker_feature.data());
-      WQSummary<float, float> summary(worker_feature.data(),
-                                      worker_feature.size());
-      auto &out = final_sketches.at(fidx);
-      out.Reduce(summary, nbytes);
-    }
+  // Deserialize the sketches back to summary containers.
+  auto reduced_payload = SketchReducePayload::Parse(Span<std::byte>{merged});
+  CHECK_EQ(reduced_payload.NumFeatures(), numeric_features.size());
+  for (std::size_t i = 0; i < numeric_features.size(); ++i) {
+    auto fidx = numeric_features[i];
+    auto entries = reduced_payload.Entries(i);
+    auto n_entries = entries.size();
 
-    reduced.at(fidx).Reserve(intermediate_num_cuts);
-    reduced.at(fidx).SetPrune(final_sketches.at(fidx), intermediate_num_cuts);
-  });
+    reduced[fidx].Reserve(n_entries);
+    reduced[fidx].CopyFrom(WQSketch::Summary{entries, n_entries});
+  }
   monitor_.Stop(__func__);
+  return reduced;
 }
 
-void AddCutPoint(WQuantileSketch<float, float>::SummaryContainer const &summary,
-                 int max_bin, HistogramCuts *cuts) {
-  size_t required_cuts = std::min(summary.size, static_cast<size_t>(max_bin));
-  auto& cut_values = cuts->cut_values_.HostVector();
-  for (size_t i = 1; i < required_cuts; ++i) {
-    bst_float cpt = summary.data[i].value;
-    if (i == 1 || cpt > cut_values.back()) {
-      cut_values.push_back(cpt);
-    }
-  }
-}
-
-void AddCategories(std::set<bst_cat_t> const &categories, HistogramCuts *cuts) {
+void AddCutPoints(WQSummaryContainer const &summary, size_t max_bin, HistogramCuts *cuts) {
   auto &cut_values = cuts->cut_values_.HostVector();
-  for (auto const &v : categories) {
-    cut_values.push_back(v);
+  auto queried = summary.QueryCutValues(max_bin);
+  cut_values.insert(cut_values.end(), queried.cbegin(), queried.cend());
+}
+
+void AddCategories(std::set<float> const &categories, float *max_cat, HistogramCuts *cuts) {
+  if (std::any_of(categories.cbegin(), categories.cend(), InvalidCat)) {
+    InvalidCategory();
+  }
+  auto &cut_values = cuts->cut_values_.HostVector();
+  auto feature_max_cat =
+      categories.empty() ? 0.0f : *std::max_element(categories.cbegin(), categories.cend());
+  CheckMaxCat(feature_max_cat, categories.size());
+  *max_cat = std::max(*max_cat, feature_max_cat);
+  for (bst_cat_t i = 0; i <= AsCat(feature_max_cat); ++i) {
+    cut_values.push_back(i);
   }
 }
 
-void HostSketchContainer::MakeCuts(HistogramCuts* cuts) {
+HistogramCuts HostSketchContainer::MakeCuts(Context const *ctx, MetaInfo const &) {
   monitor_.Start(__func__);
-  std::vector<WQSketch::SummaryContainer> reduced;
-  std::vector<int32_t> num_cuts;
-  this->AllReduce(&reduced, &num_cuts);
+  HistogramCuts cuts{static_cast<bst_feature_t>(sketches_.size())};
+  auto *p_cuts = &cuts;
 
-  cuts->min_vals_.HostVector().resize(sketches_.size(), 0.0f);
-  std::vector<WQSketch::SummaryContainer> final_summaries(reduced.size());
-
-  ParallelFor(reduced.size(), n_threads_, Sched::Guided(), [&](size_t fidx) {
+  std::vector<bst_feature_t> numeric_features;
+  std::vector<bst_feature_t> categorical_features;
+  numeric_features.reserve(sketches_.size());
+  categorical_features.reserve(sketches_.size());
+  for (bst_feature_t fidx = 0; fidx < sketches_.size(); ++fidx) {
     if (IsCat(feature_types_, fidx)) {
-      return;
-    }
-    WQSketch::SummaryContainer &a = final_summaries[fidx];
-    size_t max_num_bins = std::min(num_cuts[fidx], max_bins_);
-    a.Reserve(max_num_bins + 1);
-    CHECK(a.data);
-    if (num_cuts[fidx] != 0) {
-      a.SetPrune(reduced[fidx], max_num_bins + 1);
-      CHECK(a.data && reduced[fidx].data);
-      const bst_float mval = a.data[0].value;
-      cuts->min_vals_.HostVector()[fidx] = mval - fabs(mval) - 1e-5f;
+      categorical_features.push_back(fidx);
     } else {
-      // Empty column.
-      const float mval = 1e-5f;
-      cuts->min_vals_.HostVector()[fidx] = mval;
+      numeric_features.push_back(fidx);
     }
-  });
+  }
 
-  for (size_t fid = 0; fid < reduced.size(); ++fid) {
-    size_t max_num_bins = std::min(num_cuts[fid], max_bins_);
-    WQSketch::SummaryContainer const& a = final_summaries[fid];
+  auto reduced_numerical = this->AllReduce(ctx, Span<bst_feature_t const>{numeric_features});
+  auto reduced_categories =
+      this->AllreduceCategories(ctx, Span<bst_feature_t const>{categorical_features});
+  std::vector<std::size_t> categorical_index(sketches_.size(), 0);
+  for (std::size_t i = 0; i < categorical_features.size(); ++i) {
+    categorical_index[categorical_features[i]] = i;
+  }
+
+  auto &h_cut_ptrs = p_cuts->cut_ptrs_.HostVector();
+  float max_cat{-1.f};
+  for (size_t fid = 0; fid < reduced_numerical.size(); ++fid) {
+    size_t max_num_bins = std::min(reduced_numerical[fid].Size(), static_cast<size_t>(max_bins_));
     if (IsCat(feature_types_, fid)) {
-      AddCategories(categories_.at(fid), cuts);
+      AddCategories(reduced_categories[categorical_index[fid]], &max_cat, p_cuts);
     } else {
-      AddCutPoint(a, max_num_bins, cuts);
-      // push a value that is greater than anything
-      const bst_float cpt = (a.size > 0) ? a.data[a.size - 1].value
-                                         : cuts->min_vals_.HostVector()[fid];
-      // this must be bigger than last value in a scale
-      const bst_float last = cpt + (fabs(cpt) + 1e-5f);
-      cuts->cut_values_.HostVector().push_back(last);
+      AddCutPoints(reduced_numerical[fid], max_num_bins, p_cuts);
     }
 
     // Ensure that every feature gets at least one quantile point
-    CHECK_LE(cuts->cut_values_.HostVector().size(), std::numeric_limits<uint32_t>::max());
-    auto cut_size = static_cast<uint32_t>(cuts->cut_values_.HostVector().size());
-    CHECK_GT(cut_size, cuts->cut_ptrs_.HostVector().back());
-    cuts->cut_ptrs_.HostVector().push_back(cut_size);
+    CHECK_LE(p_cuts->cut_values_.HostVector().size(), std::numeric_limits<uint32_t>::max());
+    auto cut_size = static_cast<uint32_t>(p_cuts->cut_values_.HostVector().size());
+    CHECK_GT(cut_size, h_cut_ptrs[fid]);
+    h_cut_ptrs[fid + 1] = cut_size;
   }
+
+  p_cuts->SetCategorical(this->has_categorical_, max_cat);
+  monitor_.Stop(__func__);
+  return cuts;
+}
+
+void HostSketchContainer::PushColPage(SparsePage const &page, MetaInfo const &info,
+                                      Span<float const> hessian) {
+  monitor_.Start(__func__);
+  // glue these conditions using ternary operator to avoid making data copies.
+  auto const &weights =
+      hessian.empty() ? (use_group_ind_ ? detail::UnrollGroupWeights(info)  // use group weight
+                                        : info.weights_.HostVector())       // use sample weight
+                      : MergeWeights(info, hessian, use_group_ind_,
+                                     n_threads_);  // use hessian merged with group/sample weights
+  CHECK_EQ(weights.size(), info.num_row_);
+
+  auto view = page.GetView();
+  ParallelFor(view.Size(), n_threads_, [&](size_t fidx) {
+    auto column = view[fidx];
+    if (IsCat(feature_types_, fidx)) {
+      for (auto c : column) {
+        categories_[fidx].emplace(c.fvalue);
+      }
+      return;
+    }
+    sketches_[fidx].PushSorted(column, weights, static_cast<size_t>(max_bins_));
+  });
   monitor_.Stop(__func__);
 }
-}  // namespace common
-}  // namespace xgboost
+
+}  // namespace xgboost::common

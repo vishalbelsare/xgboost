@@ -129,7 +129,7 @@ first and second constraints (``[0, 1]``, ``[2, 3, 4]``).
 
 .. |fig1| image:: ../_static/feature_interaction_illustration2.svg
    :scale: 7%
-   :align: middle  
+   :align: middle
 
 .. |fig2| image:: ../_static/feature_interaction_illustration3.svg
    :scale: 7%
@@ -174,10 +174,14 @@ parameter:
                                      num_boost_round = 1000, evals = evallist,
                                      early_stopping_rounds = 10)
 
-**Choice of tree construction algorithm**. To use feature interaction constraints, be sure
-to set the ``tree_method`` parameter to one of the following: ``exact``, ``hist``,
-``approx`` or ``gpu_hist``.  Support for ``gpu_hist`` and ``approx`` is added only in
-1.0.0.
+**************************
+Using feature name instead
+**************************
+
+XGBoost's Python and R packages support using feature names instead of feature index for
+specifying the constraints. Given a data frame with columns ``["f0", "f1", "f2"]``, the
+feature interaction constraint can be specified as ``[["f0", "f2"]]`` (Python) or
+``list(c("f0", "f2"))`` (R, when passing them to function ``xgboost()``).
 
 **************
 Advanced topic
@@ -230,7 +234,7 @@ This has lead to some interesting implications of feature interaction constraint
 ``[[0, 1], [0, 1, 2], [1, 2]]`` as another example.  Assuming we have only 3 available
 features in our training datasets for presentation purpose, careful readers might have
 found out that the above constraint is the same as simply ``[[0, 1, 2]]``.  Since no matter which
-feature is chosen for split in the root node, all its descendants are allowd to include every
+feature is chosen for split in the root node, all its descendants are allowed to include every
 feature as legitimate split candidates without violating interaction constraints.
 
 For one last example, we use ``[[0, 1], [1, 3, 4]]`` and choose feature ``0`` as split for

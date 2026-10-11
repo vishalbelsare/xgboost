@@ -1,44 +1,67 @@
-#ifndef XGBOOST_TEST_PREDICTOR_H_
-#define XGBOOST_TEST_PREDICTOR_H_
+/**
+ * Copyright 2020-2023 by XGBoost Contributors
+ */
+#ifndef TESTS_CPP_PREDICTOR_TEST_PREDICTOR_H_
+#define TESTS_CPP_PREDICTOR_TEST_PREDICTOR_H_
 
-#include <xgboost/predictor.h>
-#include <string>
+#include <xgboost/context.h>  // for Context
+
 #include <cstddef>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "../../../src/common/kernel.h"
+#include "../../../src/gbm/gbtree_model.h"  // for GBTreeModel
+#include "../../../src/predictor/prediction_kernel.h"
 #include "../helpers.h"
 
 namespace xgboost {
+inline std::unique_ptr<gbm::GBTreeModel> CreateTestModel(LearnerModelState const* param,
+                                                         Context const* ctx, size_t n_classes = 1) {
+  auto model = std::make_unique<gbm::GBTreeModel>(param, ctx);
+
+  for (size_t i = 0; i < n_classes; ++i) {
+    std::vector<std::unique_ptr<RegTree>> trees;
+    trees.push_back(std::unique_ptr<RegTree>(new RegTree));
+    if (i == 0) {
+      (*trees.back())[0].SetLeaf(1.5f);
+      (*trees.back()).Stat(0).sum_hess = 1.0f;
+    }
+    model->CommitModelGroup(std::move(trees), i);
+  }
+
+  return model;
+}
+
+// fixme: cpu test
 template <typename Page>
-void TestPredictionFromGradientIndex(std::string name, size_t rows, size_t cols,
+void TestPredictionFromGradientIndex(Context const* ctx, size_t rows, size_t cols,
                                      std::shared_ptr<DMatrix> p_hist) {
-  constexpr size_t kClasses { 3 };
+  constexpr size_t kClasses{3};
 
-  LearnerModelParam param;
-  param.num_feature = cols;
-  param.num_output_group = kClasses;
-  param.base_score = 0.5;
+  LearnerModelState mparam{MakeMP(cols, .5, kClasses, ctx->Device())};
+  auto cuda_ctx = MakeCUDACtx(0);
 
-  auto lparam = CreateEmptyGenericParam(0);
-
-  std::unique_ptr<Predictor> predictor =
-      std::unique_ptr<Predictor>(Predictor::Create(name, &lparam));
-  predictor->Configure({});
-
-  gbm::GBTreeModel model = CreateTestModel(&param, kClasses);
+  std::unique_ptr<gbm::GBTreeModel> p_model = CreateTestModel(&mparam, ctx, kClasses);
+  auto const& model = *p_model;
 
   {
     auto p_precise = RandomDataGenerator(rows, cols, 0).GenerateDMatrix();
 
-    PredictionCacheEntry approx_out_predictions;
-    predictor->InitOutPredictions(p_hist->Info(), &approx_out_predictions.predictions, model);
-    predictor->PredictBatch(p_hist.get(), &approx_out_predictions, model, 0);
+    HostDeviceVector<float> approx_out_predictions;
+    predictor::InitOutPredictions(&cuda_ctx, p_hist->Info(), &approx_out_predictions, model);
+    common::DispatchKernel<predictor::PredictBatchKernel>(
+        &cuda_ctx, p_hist.get(), &approx_out_predictions, model, 0, 0, nullptr);
 
-    PredictionCacheEntry precise_out_predictions;
-    predictor->InitOutPredictions(p_precise->Info(), &precise_out_predictions.predictions, model);
-    predictor->PredictBatch(p_precise.get(), &precise_out_predictions, model, 0);
+    HostDeviceVector<float> precise_out_predictions;
+    predictor::InitOutPredictions(&cuda_ctx, p_precise->Info(), &precise_out_predictions, model);
+    common::DispatchKernel<predictor::PredictBatchKernel>(
+        &cuda_ctx, p_precise.get(), &precise_out_predictions, model, 0, 0, nullptr);
 
     for (size_t i = 0; i < rows; ++i) {
-      CHECK_EQ(approx_out_predictions.predictions.HostVector()[i],
-               precise_out_predictions.predictions.HostVector()[i]);
+      CHECK_EQ(approx_out_predictions.HostVector()[i], precise_out_predictions.HostVector()[i]);
     }
   }
 
@@ -47,31 +70,40 @@ void TestPredictionFromGradientIndex(std::string name, size_t rows, size_t cols,
     // histogram index from training data is valid and predictor doesn't known which
     // matrix is used for training.
     auto p_dmat = RandomDataGenerator(rows, cols, 0).GenerateDMatrix();
-    PredictionCacheEntry precise_out_predictions;
-    predictor->InitOutPredictions(p_dmat->Info(), &precise_out_predictions.predictions, model);
-    predictor->PredictBatch(p_dmat.get(), &precise_out_predictions, model, 0);
-    ASSERT_FALSE(p_dmat->PageExists<Page>());
+    HostDeviceVector<float> precise_out_predictions;
+    predictor::InitOutPredictions(&cuda_ctx, p_dmat->Info(), &precise_out_predictions, model);
+    common::DispatchKernel<predictor::PredictBatchKernel>(
+        &cuda_ctx, p_dmat.get(), &precise_out_predictions, model, 0, 0, nullptr);
+    CHECK(!p_dmat->PageExists<Page>());
   }
 }
 
+void TestInitOutPredictions(Context const* ctx);
+void TestBasic(DMatrix* dmat, Context const* ctx);
+void TestBatchPredictionWithWeights(Context const* ctx);
+void TestInplacePredictionWithWeights(Context const* ctx);
+
 // p_full and p_hist should come from the same data set.
-void TestTrainingPrediction(size_t rows, size_t bins, std::string tree_method,
-                            std::shared_ptr<DMatrix> p_full,
-                            std::shared_ptr<DMatrix> p_hist);
+void TestTrainingPrediction(Context const* ctx, size_t rows, size_t bins,
+                            std::shared_ptr<DMatrix> p_full, std::shared_ptr<DMatrix> p_hist);
 
-void TestInplacePrediction(dmlc::any x, std::string predictor,
-                           bst_row_t rows, bst_feature_t cols,
-                           int32_t device = -1);
+void TestInplacePrediction(Context const* ctx, std::shared_ptr<DMatrix> x, bst_idx_t rows,
+                           bst_feature_t cols);
 
-void TestPredictionWithLesserFeatures(std::string preditor_name);
+void TestPredictionWithLesserFeatures(Context const* ctx);
 
-void TestCategoricalPrediction(std::string name);
+void TestPredictionDeviceAccess();
 
-void TestCategoricalPredictLeaf(StringView name);
+void TestCategoricalPrediction(bool use_gpu);
 
-void TestIterationRange(std::string name);
+void TestCategoricalPredictLeaf(Context const* ctx);
 
-void TestSparsePrediction(float sparsity, std::string predictor);
+void TestIterationRange(Context const* ctx);
+
+void TestSparsePrediction(Context const* ctx, float sparsity);
+
+void TestVectorLeafPrediction(Context const* ctx);
+
 }  // namespace xgboost
 
-#endif  // XGBOOST_TEST_PREDICTOR_H_
+#endif  // TESTS_CPP_PREDICTOR_TEST_PREDICTOR_H_
